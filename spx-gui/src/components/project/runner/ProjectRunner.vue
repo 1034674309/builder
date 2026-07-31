@@ -145,6 +145,7 @@ type State =
 
 <script setup lang="ts">
 import { throttle } from 'lodash'
+import * as Sentry from '@sentry/vue'
 import { computed, onBeforeUnmount, onUnmounted, ref, shallowReactive, shallowRef, watch } from 'vue'
 import { timeout, untilNotNull } from '@/utils/utils'
 import { ProgressCollector, ProgressReporter, type Progress } from '@/utils/progress'
@@ -179,6 +180,105 @@ const state = shallowRef<State>({ type: 'initial' })
 const runnerIframeRef = ref<HTMLIFrameElement>()
 const runnerIframeWindowRef = ref<RunnerIframeWindow | null>(null)
 let engineInitPromise: Promise<void> | null = null
+let lastRuntimePanic: RuntimePanic | null = null
+let lastRuntimePanicAt = 0
+
+type RuntimePanic = {
+  error: string
+  functionName: string
+  file: string
+  line: number
+  column: number
+}
+
+async function traceRunnerOperation<T>(name: string, op: string, operation: () => Promise<T>) {
+  const span = Sentry.startInactiveSpan({
+    name,
+    op,
+    attributes: { 'spx.runtime': true }
+  })
+  try {
+    const result = await operation()
+    span.setStatus({ code: 1 })
+    return result
+  } catch (err) {
+    span.setStatus({ code: 2, message: err instanceof Cancelled ? 'cancelled' : 'error' })
+    throw err
+  } finally {
+    span.end()
+  }
+}
+
+function handleRuntimePanic(error: string, functionName: string, file: string, line: number, column: number) {
+  const panic = { error, functionName, file, line, column } satisfies RuntimePanic
+  lastRuntimePanic = panic
+  lastRuntimePanicAt = Date.now()
+
+  // Defer Sentry work until the WASM-to-JavaScript console call has returned.
+  // Calling the SDK synchronously here can corrupt Go WASM panic unwinding.
+  window.setTimeout(() => {
+    const exception = new Error(error)
+    exception.name = 'SpxRuntimePanic'
+    try {
+      Sentry.withScope((scope) => {
+        scope.setTag('spx.runtime', 'panic')
+        scope.setContext('spx', {
+          function: functionName,
+          file,
+          line,
+          column
+        })
+        Sentry.captureException(exception)
+      })
+    } catch (captureError) {
+      // Monitoring must never interfere with the project runtime.
+      console.warn('Failed to report SPX runtime panic to Sentry', captureError)
+    }
+  }, 0)
+}
+
+function parseRuntimePanic(args: unknown[]): RuntimePanic | null {
+  if (args.length !== 1 || typeof args[0] !== 'string') return null
+
+  let value: unknown
+  try {
+    value = JSON.parse(args[0])
+  } catch {
+    return null
+  }
+  if (value == null || typeof value !== 'object') return null
+
+  const record = value as Record<string, unknown>
+  if (
+    record.msg !== 'panic' ||
+    typeof record.error !== 'string' ||
+    typeof record.function !== 'string' ||
+    typeof record.file !== 'string' ||
+    typeof record.line !== 'number' ||
+    typeof record.column !== 'number'
+  ) {
+    return null
+  }
+
+  return {
+    error: record.error,
+    functionName: record.function,
+    file: record.file,
+    line: record.line,
+    column: record.column
+  }
+}
+
+function hasRecentRuntimePanic() {
+  const panic = lastRuntimePanic
+  return panic != null && Date.now() - lastRuntimePanicAt <= 5000
+}
+
+function isDuplicateRuntimeError(error: string) {
+  const panic = lastRuntimePanic
+  if (panic == null || !hasRecentRuntimePanic() || panic.error === '') return false
+  return error === '' || error.includes(panic.error)
+}
 
 watch(runnerIframeRef, (iframe) => {
   if (iframe == null) return
@@ -192,6 +292,8 @@ function handleIframeWindow(iframeWindow: RunnerIframeWindow) {
   iframeWindow.console.log = function (...args: unknown[]) {
     // eslint-disable-next-line no-console
     console.log(...args)
+    const panic = parseRuntimePanic(args)
+    if (panic != null) handleRuntimePanic(panic.error, panic.functionName, panic.file, panic.line, panic.column)
     emit('console', 'log', args)
   }
   iframeWindow.console.warn = function (...args: unknown[]) {
@@ -203,17 +305,19 @@ function handleIframeWindow(iframeWindow: RunnerIframeWindow) {
     runnerIframeWindowRef.value = iframeWindow
     iframeWindow.onGameError((err: string) => {
       state.value = { type: 'failed', err }
-      capture(err, 'ProjectRunner game error')
+      if (!isDuplicateRuntimeError(err)) capture(err, 'ProjectRunner game error')
     })
     iframeWindow.onGameExit((code: number) => {
       emit('exit', code)
     })
     iframeWindow.onEngineCrash((err: string) => {
       state.value = { type: 'failed', err }
-      capture(err, 'ProjectRunner engine crash')
+      if (!hasRecentRuntimePanic()) capture(err, 'ProjectRunner engine crash')
       reloadIframe() // The engine crashed and failed to recover by itself, so we reload the iframe.
     })
-    engineInitPromise = iframeWindow.initEngine(assetURLs, { logLevel: logLevels.LOG_LEVEL_ERROR, useProfiler: false })
+    engineInitPromise = traceRunnerOperation('SPX: Initialize engine', 'spx.engine.init', () =>
+      iframeWindow.initEngine(assetURLs, { logLevel: logLevels.LOG_LEVEL_ERROR, useProfiler: false })
+    )
     engineInitPromise.catch((err) => {
       state.value = { type: 'failed', err }
       capture(err, 'ProjectRunner init engine error')
@@ -307,6 +411,8 @@ async function runInternal(ctrl: AbortController) {
     progress: { percentage: 0, desc: null, timeLeft: null }
   } satisfies State)
   state.value = startingState
+  lastRuntimePanic = null
+  lastRuntimePanicAt = 0
   const collector = new ProgressCollector()
   collector.onProgress(throttle((progress) => (startingState.progress = progress), 100))
   try {
@@ -336,7 +442,7 @@ async function runInternal(ctrl: AbortController) {
         loadFiles(files, getProjectDataReporter, ctrl.signal)
       ]).then(async ([_, runnerFiles]) => {
         await uiUpdated(ctrl.signal)
-        await iframeWindow.initGame(runnerFiles)
+        await traceRunnerOperation('SPX: Build project', 'spx.build', () => iframeWindow.initGame(runnerFiles))
         ctrl.signal.throwIfAborted()
         initGameReporter.report(1)
       }),
@@ -354,14 +460,16 @@ async function runInternal(ctrl: AbortController) {
 
     // TODO: get progress for engine-loading, which is now included in `startGame`
     startGameReporter.startAutoReport(10_000)
-    await iframeWindow.startGame()
+    await traceRunnerOperation('SPX: Start project', 'spx.start', () => iframeWindow.startGame())
     ctrl.signal.throwIfAborted()
     startGameReporter.report(1)
     state.value = { type: 'running' }
     return hashFiles(files, ctrl.signal)
   } catch (err) {
     if (err instanceof Cancelled) throw err
-    capture(err, 'ProjectRunner run game error')
+    if (!isDuplicateRuntimeError(err instanceof Error ? err.message : typeof err === 'string' ? err : '')) {
+      capture(err, 'ProjectRunner run game error')
+    }
     state.value = { type: 'failed', err }
     throw err
   }
@@ -388,7 +496,7 @@ defineExpose({
 
     const iframeWindow = runnerIframeWindowRef.value
     if (iframeWindow == null) return
-    await iframeWindow.stopGame()
+    await traceRunnerOperation('SPX: Stop project', 'spx.stop', () => iframeWindow.stopGame())
     state.value = { type: 'initial' }
   },
   async rerun() {
