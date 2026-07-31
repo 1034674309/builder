@@ -182,6 +182,8 @@ const runnerIframeWindowRef = ref<RunnerIframeWindow | null>(null)
 let engineInitPromise: Promise<void> | null = null
 let lastRuntimePanic: RuntimePanic | null = null
 let lastRuntimePanicAt = 0
+const runtimePanicGracePeriod = 1000
+const deferredRuntimeErrorCaptures = new Set<number>()
 
 type RuntimePanic = {
   error: string
@@ -213,6 +215,7 @@ function handleRuntimePanic(error: string, functionName: string, file: string, l
   const panic = { error, functionName, file, line, column } satisfies RuntimePanic
   lastRuntimePanic = panic
   lastRuntimePanicAt = Date.now()
+  clearDeferredRuntimeErrorCaptures()
 
   // Defer Sentry work until the WASM-to-JavaScript console call has returned.
   // Calling the SDK synchronously here can corrupt Go WASM panic unwinding.
@@ -274,10 +277,21 @@ function hasRecentRuntimePanic() {
   return panic != null && Date.now() - lastRuntimePanicAt <= 5000
 }
 
-function isDuplicateRuntimeError(error: string) {
-  const panic = lastRuntimePanic
-  if (panic == null || !hasRecentRuntimePanic() || panic.error === '') return false
-  return error === '' || error.includes(panic.error)
+function clearDeferredRuntimeErrorCaptures() {
+  deferredRuntimeErrorCaptures.forEach((timer) => window.clearTimeout(timer))
+  deferredRuntimeErrorCaptures.clear()
+}
+
+function deferRuntimeErrorCapture(err: unknown, ctx: string) {
+  if (hasRecentRuntimePanic()) return
+
+  // The runner may emit a generic game error before its structured panic log reaches the parent frame.
+  // Wait briefly so a panic can replace the generic event with source-aware diagnostics.
+  const timer = window.setTimeout(() => {
+    deferredRuntimeErrorCaptures.delete(timer)
+    if (!hasRecentRuntimePanic()) capture(err, ctx)
+  }, runtimePanicGracePeriod)
+  deferredRuntimeErrorCaptures.add(timer)
 }
 
 watch(runnerIframeRef, (iframe) => {
@@ -305,14 +319,14 @@ function handleIframeWindow(iframeWindow: RunnerIframeWindow) {
     runnerIframeWindowRef.value = iframeWindow
     iframeWindow.onGameError((err: string) => {
       state.value = { type: 'failed', err }
-      if (!isDuplicateRuntimeError(err)) capture(err, 'ProjectRunner game error')
+      deferRuntimeErrorCapture(err, 'ProjectRunner game error')
     })
     iframeWindow.onGameExit((code: number) => {
       emit('exit', code)
     })
     iframeWindow.onEngineCrash((err: string) => {
       state.value = { type: 'failed', err }
-      if (!hasRecentRuntimePanic()) capture(err, 'ProjectRunner engine crash')
+      deferRuntimeErrorCapture(err, 'ProjectRunner engine crash')
       reloadIframe() // The engine crashed and failed to recover by itself, so we reload the iframe.
     })
     engineInitPromise = traceRunnerOperation('SPX: Initialize engine', 'spx.engine.init', () =>
@@ -320,7 +334,7 @@ function handleIframeWindow(iframeWindow: RunnerIframeWindow) {
     )
     engineInitPromise.catch((err) => {
       state.value = { type: 'failed', err }
-      capture(err, 'ProjectRunner init engine error')
+      deferRuntimeErrorCapture(err, 'ProjectRunner init engine error')
     })
   }
 
@@ -403,6 +417,7 @@ function getRunCtrl() {
 
 onUnmounted(() => {
   runCtrl?.abort(new Cancelled('unmounted'))
+  clearDeferredRuntimeErrorCaptures()
 })
 
 async function runInternal(ctrl: AbortController) {
@@ -413,6 +428,7 @@ async function runInternal(ctrl: AbortController) {
   state.value = startingState
   lastRuntimePanic = null
   lastRuntimePanicAt = 0
+  clearDeferredRuntimeErrorCaptures()
   const collector = new ProgressCollector()
   collector.onProgress(throttle((progress) => (startingState.progress = progress), 100))
   try {
@@ -467,9 +483,7 @@ async function runInternal(ctrl: AbortController) {
     return hashFiles(files, ctrl.signal)
   } catch (err) {
     if (err instanceof Cancelled) throw err
-    if (!isDuplicateRuntimeError(err instanceof Error ? err.message : typeof err === 'string' ? err : '')) {
-      capture(err, 'ProjectRunner run game error')
-    }
+    deferRuntimeErrorCapture(err, 'ProjectRunner run game error')
     state.value = { type: 'failed', err }
     throw err
   }
