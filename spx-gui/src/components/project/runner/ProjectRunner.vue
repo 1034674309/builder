@@ -182,8 +182,14 @@ const runnerIframeWindowRef = ref<RunnerIframeWindow | null>(null)
 let engineInitPromise: Promise<void> | null = null
 let lastRuntimePanic: RuntimePanic | null = null
 let lastRuntimePanicAt = 0
-const runtimePanicGracePeriod = 1000
+const runtimePanicGracePeriodMs = 1000
+// Generic error callbacks can follow a structured panic log later during engine shutdown.
+const runtimePanicDedupWindowMs = 5000
 const deferredRuntimeErrorCaptures = new Set<number>()
+const sentrySpanStatus = {
+  ok: 1,
+  error: 2
+} as const
 
 type RuntimePanic = {
   error: string
@@ -201,18 +207,17 @@ async function traceRunnerOperation<T>(name: string, op: string, operation: () =
   })
   try {
     const result = await operation()
-    span.setStatus({ code: 1 })
+    span.setStatus({ code: sentrySpanStatus.ok })
     return result
   } catch (err) {
-    span.setStatus({ code: 2, message: err instanceof Cancelled ? 'cancelled' : 'error' })
+    span.setStatus({ code: sentrySpanStatus.error, message: err instanceof Cancelled ? 'cancelled' : 'error' })
     throw err
   } finally {
     span.end()
   }
 }
 
-function handleRuntimePanic(error: string, functionName: string, file: string, line: number, column: number) {
-  const panic = { error, functionName, file, line, column } satisfies RuntimePanic
+function handleRuntimePanic(panic: RuntimePanic) {
   lastRuntimePanic = panic
   lastRuntimePanicAt = Date.now()
   clearDeferredRuntimeErrorCaptures()
@@ -220,16 +225,16 @@ function handleRuntimePanic(error: string, functionName: string, file: string, l
   // Defer Sentry work until the WASM-to-JavaScript console call has returned.
   // Calling the SDK synchronously here can corrupt Go WASM panic unwinding.
   window.setTimeout(() => {
-    const exception = new Error(error)
+    const exception = new Error(panic.error)
     exception.name = 'SpxRuntimePanic'
     try {
       Sentry.withScope((scope) => {
         scope.setTag('spx.runtime', 'panic')
         scope.setContext('spx', {
-          function: functionName,
-          file,
-          line,
-          column
+          function: panic.functionName,
+          file: panic.file,
+          line: panic.line,
+          column: panic.column
         })
         Sentry.captureException(exception)
       })
@@ -241,11 +246,15 @@ function handleRuntimePanic(error: string, functionName: string, file: string, l
 }
 
 function parseRuntimePanic(args: unknown[]): RuntimePanic | null {
-  if (args.length !== 1 || typeof args[0] !== 'string') return null
+  const [arg] = args
+  if (args.length !== 1 || typeof arg !== 'string') return null
+
+  // Panic logs are JSON objects produced by the ispx slog handler. Avoid JSON.parse for normal game logs.
+  if (!arg.startsWith('{') || !arg.includes('"msg"') || !arg.includes('"panic"')) return null
 
   let value: unknown
   try {
-    value = JSON.parse(args[0])
+    value = JSON.parse(arg)
   } catch {
     return null
   }
@@ -274,7 +283,7 @@ function parseRuntimePanic(args: unknown[]): RuntimePanic | null {
 
 function hasRecentRuntimePanic() {
   const panic = lastRuntimePanic
-  return panic != null && Date.now() - lastRuntimePanicAt <= 5000
+  return panic != null && Date.now() - lastRuntimePanicAt <= runtimePanicDedupWindowMs
 }
 
 function clearDeferredRuntimeErrorCaptures() {
@@ -290,7 +299,7 @@ function deferRuntimeErrorCapture(err: unknown, ctx: string) {
   const timer = window.setTimeout(() => {
     deferredRuntimeErrorCaptures.delete(timer)
     if (!hasRecentRuntimePanic()) capture(err, ctx)
-  }, runtimePanicGracePeriod)
+  }, runtimePanicGracePeriodMs)
   deferredRuntimeErrorCaptures.add(timer)
 }
 
@@ -307,7 +316,7 @@ function handleIframeWindow(iframeWindow: RunnerIframeWindow) {
     // eslint-disable-next-line no-console
     console.log(...args)
     const panic = parseRuntimePanic(args)
-    if (panic != null) handleRuntimePanic(panic.error, panic.functionName, panic.file, panic.line, panic.column)
+    if (panic != null) handleRuntimePanic(panic)
     emit('console', 'log', args)
   }
   iframeWindow.console.warn = function (...args: unknown[]) {
