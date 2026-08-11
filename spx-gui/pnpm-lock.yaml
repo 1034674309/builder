@@ -84,8 +84,8 @@ importers:
         specifier: ^0.8.1
         version: 0.8.1(typescript@5.9.3)(vue@3.5.25(typescript@5.9.3))
       '@xgo-pkgs/spx':
-        specifier: 3.0.0
-        version: 3.0.0
+        specifier: 3.1.0
+        version: 3.1.0
       bowser:
         specifier: ^2.14.1
         version: 2.14.1
@@ -1227,8 +1227,8 @@ packages:
     peerDependencies:
       vue: ^3.5.0
 
-  '@xgo-pkgs/spx@3.0.0':
-    resolution: {integrity: sha512-+aLj+XSXJZpuBJcAGgOqhHDEBs7qcer3xQ/ZkiSvNPDdXEfn1006V1X8VS6avXsGyr/eKSHV4ep4rpuKMgQrRg==}
+  '@xgo-pkgs/spx@3.1.0':
+    resolution: {integrity: sha512-j2vDe8MtD/CqSNNoAOXei2XMlKH/fnnWWof8y5KFo/FMqZb3QKT9eBU3LoHPiXxnIilnYVA9gYdPpXVX3JX/ew==}
 
   abbrev@2.0.0:
     resolution: {integrity: sha512-6/mh1E2u2YgEsCHdY0Yx5oW+61gZU+1vXaoiHHrpKeuRNNgFvS+/jrwHiQhB5apAf5oB7UB7E19ol2R2LKH8hQ==}
@@ -4198,7 +4198,7 @@ snapshots:
     dependencies:
       vue: 3.5.25(typescript@5.9.3)
 
-  '@xgo-pkgs/spx@3.0.0': {}
+  '@xgo-pkgs/spx@3.1.0': {}
 
   abbrev@2.0.0: {}
 
