@@ -144,6 +144,9 @@ func SetDefaultTransport(t Transport) {
 // TooManyRequestsError represents a transport-level HTTP 429 error.
 type TooManyRequestsError struct {
 	RetryAfter time.Duration
+	Category   string
+	Reason     string
+	RequestID  string
 	Err        error
 }
 

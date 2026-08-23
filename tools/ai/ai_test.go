@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"sync"
@@ -114,6 +115,44 @@ func TestPlayerThinkReportsTurnLimit(t *testing.T) {
 		}
 	default:
 		t.Fatal("turn limit did not trigger error handler")
+	}
+}
+
+func TestPlayerThinkQuotaExceededDoesNotRetry(t *testing.T) {
+	originalTransport := DefaultTransport()
+	t.Cleanup(func() { SetDefaultTransport(originalTransport) })
+
+	interactCalls := 0
+	SetDefaultTransport(&mockTransport{
+		InteractFunc: func(_ context.Context, _ Request) (Response, error) {
+			interactCalls++
+			return Response{}, ErrorFromHTTPResponse(403, 0, `{"code":40301,"msg":"Quota exceeded"}`, errors.New("quota exceeded"))
+		},
+	})
+
+	errorCh := make(chan error, 1)
+	p := &Player{errorHandler: func(err error) { errorCh <- err }}
+	p.think(t.Context(), nil, "hello", nil)
+
+	if interactCalls != 1 {
+		t.Fatalf("got %d interact calls, want 1 (quota must not retry)", interactCalls)
+	}
+	select {
+	case err := <-errorCh:
+		if !isQuotaExceeded(err) {
+			t.Fatalf("error handler got %v, want quota exceeded", err)
+		}
+	default:
+		t.Fatal("quota did not trigger error handler")
+	}
+	if lastThinkFinish.outcome != outcomeQuotaExhausted {
+		t.Fatalf("outcome = %q, want %s", lastThinkFinish.outcome, outcomeQuotaExhausted)
+	}
+	if lastThinkFinish.attemptCount != 1 {
+		t.Fatalf("attemptCount = %d, want 1", lastThinkFinish.attemptCount)
+	}
+	if lastThinkFinish.shouldCaptureException() || lastThinkFinish.bridgeException("s") != nil {
+		t.Fatal("quota must not capture exception")
 	}
 }
 

@@ -89,8 +89,8 @@ func (t *wasmTransport) Archive(ctx context.Context, turns []ai.Turn, existingAr
 	return resp, nil
 }
 
-// buildHeaders creates request headers with proper authentication.
-func (t *wasmTransport) buildHeaders() map[string]any {
+// buildHeaders creates request headers with proper authentication and Sentry trace context.
+func (t *wasmTransport) buildHeaders(ctx context.Context) map[string]any {
 	headers := map[string]any{
 		"Content-Type": "application/json",
 	}
@@ -99,12 +99,18 @@ func (t *wasmTransport) buildHeaders() map[string]any {
 			headers["Authorization"] = "Bearer " + token
 		}
 	}
+	if sentryTrace, baggage := ai.TraceHeadersFromContext(ctx); sentryTrace != "" {
+		headers["Sentry-Trace"] = sentryTrace
+		if baggage != "" {
+			headers["Baggage"] = baggage
+		}
+	}
 	return headers
 }
 
 // fetchAndParse performs a fetch request and parses the JSON response into the target.
 func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []byte, result any) error {
-	headers := t.buildHeaders()
+	headers := t.buildHeaders(ctx)
 
 	jsAbortController := js.Global().Get("AbortController").New()
 	defer context.AfterFunc(ctx, func() {
@@ -119,7 +125,7 @@ func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []b
 		"signal":  jsAbortSignal,
 	}))
 	if err != nil {
-		return fmt.Errorf("failed to fetch: %w", err)
+		return ai.AnnotateTransportError(ctx, fmt.Errorf("failed to fetch: %w", err))
 	}
 
 	if !jsResp.Get("ok").Bool() {
@@ -136,29 +142,18 @@ func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []b
 		bodyPromise := jsResp.Call("text")
 		bodyTextVal, bodyErr := awaitPromise(ctx, bodyPromise)
 		if bodyErr != nil {
-			err := fmt.Errorf("failed to fetch with status %d %s (and failed to read error body: %w)", status, statusText, bodyErr)
-			if status == 429 {
-				return &ai.TooManyRequestsError{
-					RetryAfter: retryAfter,
-					Err:        err,
-				}
-			}
-			return err
+			fallback := fmt.Errorf("failed to fetch with status %d %s (and failed to read error body: %w)", status, statusText, bodyErr)
+			return ai.AnnotateTransportError(ctx, ai.ErrorFromHTTPResponse(status, retryAfter, "", fallback))
 		}
 
 		bodyText := bodyTextVal.String()
-		if status == 429 {
-			return &ai.TooManyRequestsError{
-				RetryAfter: retryAfter,
-				Err:        fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText),
-			}
-		}
-		return fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText)
+		fallback := fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText)
+		return ai.AnnotateTransportError(ctx, ai.ErrorFromHTTPResponse(status, retryAfter, bodyText, fallback))
 	}
 
 	jsJSON, err := awaitPromise(ctx, jsResp.Call("json"))
 	if err != nil {
-		return fmt.Errorf("failed to process json response: %w", err)
+		return ai.AnnotateTransportError(ctx, fmt.Errorf("failed to process json response: %w", err))
 	}
 	jsonString := js.Global().Get("JSON").Call("stringify", jsJSON).String()
 
