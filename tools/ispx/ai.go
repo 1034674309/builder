@@ -17,6 +17,8 @@ func init() {
 	js.Global().Set("xbuilder_set_ai_description", js.FuncOf(setAIDescription))
 	js.Global().Set("xbuilder_set_ai_interaction_api_endpoint", js.FuncOf(setAIInteractionAPIEndpoint))
 	js.Global().Set("xbuilder_set_ai_interaction_api_token_provider", js.FuncOf(setAIInteractionAPITokenProvider))
+	js.Global().Set("xbuilder_set_game_session_id", js.FuncOf(setGameSessionID))
+	js.Global().Set("xbuilder_set_sentry_bridge", js.FuncOf(setSentryBridge))
 }
 
 // initAI initializes AI integration for the ispx interpreter.
@@ -53,6 +55,20 @@ func setAIDescription(this js.Value, args []js.Value) any {
 
 // aiInteractionAPIEndpoint holds the endpoint URL for AI Interaction API.
 var aiInteractionAPIEndpoint string
+
+func setGameSessionID(this js.Value, args []js.Value) any {
+	if len(args) > 0 {
+		ai.SetGameSessionID(args[0].String())
+	}
+	return nil
+}
+
+func setSentryBridge(this js.Value, args []js.Value) any {
+	if len(args) > 0 {
+		ai.SetSentryBridge(args[0])
+	}
+	return nil
+}
 
 // setAIInteractionAPIEndpoint sets [aiInteractionAPIEndpoint] from JavaScript.
 func setAIInteractionAPIEndpoint(this js.Value, args []js.Value) any {

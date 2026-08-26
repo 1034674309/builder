@@ -12,8 +12,10 @@ export const defaultFontPreferences = (import.meta.env.VITE_DEFAULT_FONT_PREFERE
 export const accountOAuthClientId = import.meta.env.VITE_ACCOUNT_OAUTH_CLIENT_ID as string
 const sentryTracesSampleRate = parseFloat(import.meta.env.VITE_SENTRY_TRACES_SAMPLE_RATE as string)
 const sentryLSPSampleRate = parseFloat(import.meta.env.VITE_SENTRY_LSP_SAMPLE_RATE as string)
+const sentryAISampleRate = parseFloat(import.meta.env.VITE_SENTRY_AI_SAMPLE_RATE as string)
 export const sentry = {
   dsn: (import.meta.env.VITE_SENTRY_DSN as string) || '',
   tracesSampleRate: Number.isNaN(sentryTracesSampleRate) ? 0.1 : sentryTracesSampleRate,
-  lspSampleRate: Number.isNaN(sentryLSPSampleRate) ? 0.1 : sentryLSPSampleRate
+  lspSampleRate: Number.isNaN(sentryLSPSampleRate) ? 0.1 : sentryLSPSampleRate,
+  aiSampleRate: Number.isNaN(sentryAISampleRate) ? 1 : sentryAISampleRate
 }

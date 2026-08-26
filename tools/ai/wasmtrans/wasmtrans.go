@@ -89,7 +89,8 @@ func (t *wasmTransport) Archive(ctx context.Context, turns []ai.Turn, existingAr
 	return resp, nil
 }
 
-// buildHeaders creates request headers with proper authentication.
+// buildHeaders creates request headers with proper authentication. The parent
+// page's fetchAI bridge creates the client span and adds trace headers.
 func (t *wasmTransport) buildHeaders() map[string]any {
 	headers := map[string]any{
 		"Content-Type": "application/json",
@@ -106,64 +107,78 @@ func (t *wasmTransport) buildHeaders() map[string]any {
 func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []byte, result any) error {
 	headers := t.buildHeaders()
 
-	jsAbortController := js.Global().Get("AbortController").New()
-	defer context.AfterFunc(ctx, func() {
-		jsAbortController.Call("abort")
-	})()
-	jsAbortSignal := jsAbortController.Get("signal")
+	// Local AbortController covers the no-bridge native fetch path, where
+	// AbortAI is a no-op. When the bridge exists, AfterFunc still aborts
+	// this signal and also asks the parent page to abort.
+	controller := js.Global().Get("AbortController").New()
+	stopAbort := context.AfterFunc(ctx, func() {
+		controller.Call("abort")
+		ai.AbortAI(ctx)
+	})
+	defer stopAbort()
 
-	jsResp, err := awaitPromise(ctx, js.Global().Call("fetch", t.endpoint+path, map[string]any{
+	jsResp, err := awaitPromise(ctx, ai.FetchAI(ctx, t.endpoint+path, map[string]any{
 		"method":  "POST",
 		"headers": headers,
 		"body":    string(body),
-		"signal":  jsAbortSignal,
+		"signal":  controller.Get("signal"),
 	}))
 	if err != nil {
-		return fmt.Errorf("failed to fetch: %w", err)
+		return ai.AnnotateTransportError(ctx, fmt.Errorf("failed to fetch: %w", err))
 	}
 
 	if !jsResp.Get("ok").Bool() {
 		status := jsResp.Get("status").Int()
 		statusText := jsResp.Get("statusText").String()
-		retryAfter := time.Duration(0)
-		if headers := jsResp.Get("headers"); headers.Truthy() {
-			headerValue := headers.Call("get", "Retry-After")
-			if headerValue.Truthy() {
-				retryAfter = ai.RetryAfterFromHeader(headerValue.String())
-			}
-		}
+		retryAfter := retryAfterFromResponse(jsResp)
 
-		bodyPromise := jsResp.Call("text")
-		bodyTextVal, bodyErr := awaitPromise(ctx, bodyPromise)
+		bodyText, bodyErr := responseBody(ctx, jsResp)
 		if bodyErr != nil {
-			err := fmt.Errorf("failed to fetch with status %d %s (and failed to read error body: %w)", status, statusText, bodyErr)
-			if status == 429 {
-				return &ai.TooManyRequestsError{
-					RetryAfter: retryAfter,
-					Err:        err,
-				}
-			}
-			return err
+			fallback := fmt.Errorf("failed to fetch with status %d %s (and failed to read error body: %w)", status, statusText, bodyErr)
+			return ai.AnnotateTransportError(ctx, ai.ErrorFromHTTPResponse(status, retryAfter, "", fallback))
 		}
-
-		bodyText := bodyTextVal.String()
-		if status == 429 {
-			return &ai.TooManyRequestsError{
-				RetryAfter: retryAfter,
-				Err:        fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText),
-			}
-		}
-		return fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText)
+		fallback := fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText)
+		return ai.AnnotateTransportError(ctx, ai.ErrorFromHTTPResponse(status, retryAfter, bodyText, fallback))
 	}
 
-	jsJSON, err := awaitPromise(ctx, jsResp.Call("json"))
+	bodyText, err := responseBody(ctx, jsResp)
 	if err != nil {
-		return fmt.Errorf("failed to process json response: %w", err)
+		return ai.AnnotateTransportError(ctx, fmt.Errorf("failed to process json response: %w", err))
 	}
-	jsonString := js.Global().Get("JSON").Call("stringify", jsJSON).String()
-
-	if err := json.Unmarshal([]byte(jsonString), result); err != nil {
+	if err := json.Unmarshal([]byte(bodyText), result); err != nil {
 		return fmt.Errorf("failed to unmarshal response json: %w", err)
 	}
 	return nil
+}
+
+// responseBody accepts both the bridge's normalized response ({body: string})
+// and the native Response returned by the no-bridge fallback. In either case
+// the body is consumed at most once.
+func responseBody(ctx context.Context, response js.Value) (string, error) {
+	body := response.Get("body")
+	if body.Type() == js.TypeString {
+		return body.String(), nil
+	}
+	bodyText, err := awaitPromise(ctx, response.Call("text"))
+	if err != nil {
+		return "", err
+	}
+	return bodyText.String(), nil
+}
+
+// retryAfterFromResponse reads the bridge's retryAfter field, or the native
+// Response Retry-After header used by the no-bridge fetch fallback.
+func retryAfterFromResponse(jsResp js.Value) time.Duration {
+	if value := jsResp.Get("retryAfter"); value.Type() == js.TypeString {
+		return ai.RetryAfterFromHeader(value.String())
+	}
+	headers := jsResp.Get("headers")
+	if !headers.Truthy() {
+		return 0
+	}
+	got := headers.Call("get", "Retry-After")
+	if got.Type() != js.TypeString {
+		return 0
+	}
+	return ai.RetryAfterFromHeader(got.String())
 }

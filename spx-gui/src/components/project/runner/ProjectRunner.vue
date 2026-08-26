@@ -52,10 +52,73 @@ type RunnerFiles = {
   [path: string]: RunnerFile
 }
 
+type AIFetchResult = {
+  ok: boolean
+  status: number
+  statusText: string
+  retryAfter: string
+  body: string
+}
+
+/** Parent-page Sentry hooks injected into the runner iframe. WASM calls these during Think / Archive. */
+type AISentryBridge = {
+  startThink: (info: { thinkId: string; startTime: number; gameSessionId: string }) => boolean
+  endThink: (info: {
+    thinkId: string
+    endTime: number
+    outcome?: string
+    category?: string
+    reason?: string
+    turnCount?: number
+    attemptCount?: number
+    exception?: {
+      message: string
+      userMsg?: string
+      commandName?: string
+      commandArgs?: string
+      turnIndex?: number
+      attempt?: number
+      category?: string
+      reason?: string
+      gameSessionId?: string
+    }
+  }) => void
+  startAttempt: (info: { attemptId: string; thinkId?: string; archiveId?: string }) => void
+  fetchAI: (info: {
+    attemptId: string
+    url: string
+    method: string
+    headers: Record<string, string>
+    body: string
+    signal?: AbortSignal
+  }) => Promise<AIFetchResult>
+  abortAI: (info: { attemptId: string }) => void
+  startCommand: (info: { thinkId: string; startTime: number; turnIndex: number; commandName: string }) => void
+  endCommand: (info: { thinkId: string; endTime: number; ok: boolean; errorMessage: string }) => void
+  startArchive: (info: { archiveId: string; startTime: number; gameSessionId: string }) => boolean
+  endArchive: (info: {
+    archiveId: string
+    endTime: number
+    ok?: boolean
+    attemptCount?: number
+    category?: string
+    reason?: string
+    exception?: {
+      message: string
+      attemptCount?: number
+      category?: string
+      reason?: string
+      gameSessionId?: string
+    }
+  }) => void
+}
+
 interface RunnerIframeWindow extends Window {
   xbuilder_set_ai_interaction_api_endpoint: (endpoint: string) => void
   xbuilder_set_ai_interaction_api_token_provider: (provider: () => Promise<string>) => void
   xbuilder_set_ai_description: (description: string) => void
+  xbuilder_set_game_session_id: (id: string) => void
+  xbuilder_set_sentry_bridge: (bridge: AISentryBridge) => void
   /** Set the current logged-in username, injected into the spx runtime before running. */
   xbuilder_set_username: (username: string) => void
   /** Init the engine. Can be called early; project-agnostic. */
@@ -145,6 +208,7 @@ type State =
 
 <script setup lang="ts">
 import { throttle } from 'lodash'
+import * as Sentry from '@sentry/vue'
 import { computed, onBeforeUnmount, onUnmounted, ref, shallowReactive, shallowRef, watch } from 'vue'
 import { timeout, untilNotNull } from '@/utils/utils'
 import { ProgressCollector, ProgressReporter, type Progress } from '@/utils/progress'
@@ -179,6 +243,398 @@ const state = shallowRef<State>({ type: 'initial' })
 const runnerIframeRef = ref<HTMLIFrameElement>()
 const runnerIframeWindowRef = ref<RunnerIframeWindow | null>(null)
 let engineInitPromise: Promise<void> | null = null
+
+async function readAIResponse(response: Response): Promise<AIFetchResult> {
+  const body = await response.text()
+  return {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    retryAfter: response.headers.get('Retry-After') ?? '',
+    body
+  }
+}
+
+function mergeAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal {
+  const active = signals.filter((signal): signal is AbortSignal => signal != null)
+  if (active.length === 1) return active[0]
+  const merged = new AbortController()
+  const abort = () => merged.abort()
+  for (const signal of active) {
+    if (signal.aborted) {
+      merged.abort()
+      return merged.signal
+    }
+    signal.addEventListener('abort', abort, { once: true })
+  }
+  return merged.signal
+}
+
+function createAISentryBridge(): AISentryBridge {
+  type InactiveSpan = ReturnType<typeof Sentry.startInactiveSpan>
+  type AttemptState = {
+    parentSpan: InactiveSpan
+    clientSpan: InactiveSpan | null
+    controller: AbortController | null
+    aborted: boolean
+  }
+  type ThinkState = {
+    thinkSpan: InactiveSpan
+    commandSpan: InactiveSpan | null
+    attempts: Set<string>
+    ended: boolean
+  }
+  type ArchiveState = {
+    archiveSpan: InactiveSpan
+    attempts: Set<string>
+    ended: boolean
+  }
+
+  const thinks = new Map<string, ThinkState>()
+  const archives = new Map<string, ArchiveState>()
+  const attempts = new Map<string, AttemptState>()
+  const spanStatus = { ok: 1, error: 2 } as const
+
+  const endSpan = (span: InactiveSpan | null, endTime: number, ok?: boolean) => {
+    if (span == null) return
+    if (ok != null) {
+      span.setStatus({ code: ok ? spanStatus.ok : spanStatus.error })
+    }
+    span.end(endTime)
+  }
+
+  const startChildSpan = (
+    parentSpan: InactiveSpan,
+    options: Parameters<typeof Sentry.startInactiveSpan>[0]
+  ): InactiveSpan => {
+    const span = Sentry.startInactiveSpan({ ...options, parentSpan })
+    // Browser SDK sets parentSpanIsAlwaysRootSpan, so parentSpan is ignored and
+    // children would attach to pageload. Same workaround as spx-lsp-client.
+    // https://github.com/getsentry/sentry-javascript/issues/16769
+    ;(span as { _parentSpanId?: string })._parentSpanId = parentSpan.spanContext().spanId
+    return span
+  }
+
+  // Root registration and request bookkeeping are synchronous because Go needs
+  // the IDs immediately. Sentry operations are deferred so they do not run on
+  // the synchronous Go WASM callback stack.
+  const later = (fn: () => void) => {
+    setTimeout(fn, 0)
+  }
+
+  const endClient = (attempt: AttemptState, endTime: number, ok?: boolean) => {
+    if (attempt.clientSpan == null) return
+    try {
+      endSpan(attempt.clientSpan, endTime, ok)
+    } catch {
+      // Sentry cleanup is best effort and must not affect the AI request.
+    } finally {
+      attempt.clientSpan = null
+    }
+  }
+
+  const finishAttempt = (attemptId: string, endTime: number, ok?: boolean) => {
+    const attempt = attempts.get(attemptId)
+    if (attempt == null) return
+    if (attempt.clientSpan != null) {
+      endClient(attempt, endTime, ok)
+    }
+    attempts.delete(attemptId)
+  }
+
+  const registerAttempt = (parentSpan: InactiveSpan, ids: Set<string>, attemptId: string) => {
+    attempts.set(attemptId, {
+      parentSpan,
+      clientSpan: null,
+      controller: null,
+      aborted: false
+    })
+    ids.add(attemptId)
+  }
+
+  const setSpanAttr = (span: InactiveSpan, key: string, value: string | number | undefined) => {
+    if (value == null || value === '') return
+    span.setAttribute(key, value)
+  }
+
+  const captureFailure = (
+    name: string,
+    span: InactiveSpan,
+    message: string | undefined,
+    tags: Record<string, string | undefined>,
+    detail: Record<string, unknown>,
+    warn: string
+  ) => {
+    if (message == null || message === '') return
+    const error = new Error(message)
+    error.name = name
+    try {
+      Sentry.withScope((scope) => {
+        for (const [key, value] of Object.entries(tags)) {
+          if (value) scope.setTag(key, value)
+        }
+        scope.setContext('ai', detail)
+        const report = () => Sentry.captureException(error)
+        if (span != null) {
+          Sentry.withActiveSpan(span, report)
+        } else {
+          report()
+        }
+      })
+    } catch (captureError) {
+      console.warn(warn, captureError)
+    }
+  }
+
+  const captureThinkException = (
+    span: InactiveSpan,
+    exception: Parameters<AISentryBridge['endThink']>[0]['exception']
+  ) => {
+    if (exception == null) return
+    const tags: Record<string, string | undefined> = {
+      game_session_id: exception.gameSessionId,
+      category: exception.category,
+      reason: exception.reason
+    }
+    if (exception.reason === 'timeout' || exception.reason === 'network') {
+      if (exception.turnIndex != null) tags.turn_index = String(exception.turnIndex)
+      if (exception.attempt != null) tags.attempt = String(exception.attempt)
+    }
+    if (
+      (exception.reason === 'invalid_arguments' || exception.reason === 'handler_panic') &&
+      exception.turnIndex != null
+    ) {
+      tags.turn_index = String(exception.turnIndex)
+    }
+    captureFailure(
+      'AIThinkFailure',
+      span,
+      exception.message,
+      tags,
+      {
+        ...(exception.userMsg ? { user_msg: exception.userMsg } : {}),
+        ...(exception.commandName ? { command_name: exception.commandName } : {}),
+        ...(exception.commandArgs ? { command_args: exception.commandArgs } : {}),
+        error: exception.message
+      },
+      'Failed to report AI think failure to Sentry'
+    )
+  }
+
+  const captureArchiveException = (
+    span: InactiveSpan,
+    exception: Parameters<AISentryBridge['endArchive']>[0]['exception']
+  ) => {
+    if (exception == null) return
+    captureFailure(
+      'AIArchiveFailure',
+      span,
+      exception.message,
+      {
+        game_session_id: exception.gameSessionId,
+        category: exception.category,
+        reason: exception.reason
+      },
+      {
+        ...(exception.attemptCount != null ? { attempt_count: exception.attemptCount } : {}),
+        error: exception.message
+      },
+      'Failed to report AI archive failure to Sentry'
+    )
+  }
+
+  return {
+    startThink(info) {
+      const thinkSpan = Sentry.startNewTrace(() =>
+        Sentry.startInactiveSpan({
+          name: 'ai.think',
+          op: 'ai.think',
+          forceTransaction: true,
+          parentSpan: null,
+          // WASM-provided unix seconds; Think duration is not a latency signal.
+          startTime: info.startTime,
+          attributes: { game_session_id: info.gameSessionId }
+        })
+      )
+      thinks.set(info.thinkId, {
+        thinkSpan,
+        commandSpan: null,
+        attempts: new Set(),
+        ended: false
+      })
+      return true
+    },
+    endThink(info) {
+      later(() => {
+        const state = thinks.get(info.thinkId)
+        if (state == null || state.ended) return
+        state.ended = true
+        captureThinkException(state.thinkSpan, info.exception)
+        setSpanAttr(state.thinkSpan, 'outcome', info.outcome)
+        setSpanAttr(state.thinkSpan, 'category', info.category)
+        setSpanAttr(state.thinkSpan, 'reason', info.reason)
+        setSpanAttr(state.thinkSpan, 'turn_count', info.turnCount)
+        setSpanAttr(state.thinkSpan, 'attempt_count', info.attemptCount)
+        let thinkOK: boolean | undefined
+        if (info.outcome === 'success') thinkOK = true
+        else if (info.outcome === 'failure') thinkOK = false
+        endSpan(state.commandSpan, info.endTime)
+        state.attempts.forEach((attemptId) => finishAttempt(attemptId, info.endTime, thinkOK))
+        endSpan(state.thinkSpan, info.endTime, thinkOK)
+        thinks.delete(info.thinkId)
+      })
+    },
+    startAttempt(info) {
+      if (info.thinkId != null) {
+        const state = thinks.get(info.thinkId)
+        if (state == null || state.ended) return
+        registerAttempt(state.thinkSpan, state.attempts, info.attemptId)
+        return
+      }
+      if (info.archiveId != null) {
+        const state = archives.get(info.archiveId)
+        if (state == null || state.ended) return
+        registerAttempt(state.archiveSpan, state.attempts, info.attemptId)
+      }
+    },
+    fetchAI(info) {
+      return new Promise((resolve, reject) => {
+        // Keep span creation and fetch off the synchronous WASM callback stack.
+        setTimeout(() => {
+          const attempt = attempts.get(info.attemptId)
+          const controller = new AbortController()
+          if (attempt != null) {
+            attempt.controller = controller
+            if (attempt.aborted) controller.abort()
+          }
+          const signal = mergeAbortSignals([info.signal, controller.signal])
+          const runFetch = (headers: Headers) =>
+            window
+              .fetch(info.url, {
+                method: info.method,
+                headers,
+                body: info.body,
+                signal
+              })
+              .then(readAIResponse)
+
+          const finishResult = (result: AIFetchResult) => {
+            try {
+              if (attempt?.clientSpan != null) {
+                Sentry.setHttpStatus(attempt.clientSpan, result.status)
+              }
+            } catch {
+              // Sentry annotation is best effort.
+            }
+            // setHttpStatus already sets the span status for an HTTP response;
+            // do not overwrite its useful status message while closing it.
+            finishAttempt(info.attemptId, Date.now() / 1000)
+            resolve(result)
+          }
+          const finishError = (error: unknown) => {
+            finishAttempt(info.attemptId, Date.now() / 1000, false)
+            reject(error)
+          }
+
+          if (attempt == null) {
+            runFetch(new Headers(info.headers)).then(finishResult, finishError)
+            return
+          }
+          try {
+            attempt.clientSpan = startChildSpan(attempt.parentSpan, {
+              name: `${info.method} ${info.url}`,
+              op: 'http.client',
+              attributes: {
+                'http.method': info.method,
+                'http.url': info.url
+              }
+            })
+            const headers = new Headers(info.headers)
+            const traceData = Sentry.getTraceData({ span: attempt.clientSpan })
+            if (traceData['sentry-trace']) headers.set('Sentry-Trace', traceData['sentry-trace'])
+            if (traceData.baggage) headers.set('Baggage', traceData.baggage)
+            Promise.resolve(Sentry.withActiveSpan(attempt.clientSpan, () => runFetch(headers))).then(
+              finishResult,
+              finishError
+            )
+          } catch {
+            // Sentry instrumentation must never leave the AI request pending.
+            endClient(attempt, Date.now() / 1000, false)
+            runFetch(new Headers(info.headers)).then(finishResult, finishError)
+          }
+        }, 0)
+      })
+    },
+    abortAI(info) {
+      const attempt = attempts.get(info.attemptId)
+      if (attempt == null) return
+      attempt.aborted = true
+      attempt.controller?.abort()
+    },
+    startCommand(info) {
+      later(() => {
+        const state = thinks.get(info.thinkId)
+        if (state == null || state.ended) return
+        endSpan(state.commandSpan, info.startTime)
+        state.commandSpan = startChildSpan(state.thinkSpan, {
+          name: 'ai.command.execute',
+          op: 'ai.command.execute',
+          startTime: info.startTime,
+          attributes: {
+            turn_index: info.turnIndex,
+            command_name: info.commandName
+          }
+        })
+      })
+    },
+    endCommand(info) {
+      later(() => {
+        const state = thinks.get(info.thinkId)
+        if (state == null || state.ended) return
+        if (info.errorMessage) {
+          state.commandSpan?.setAttribute('error_message', info.errorMessage.slice(0, 1024))
+        }
+        endSpan(state.commandSpan, info.endTime, info.ok)
+        state.commandSpan = null
+      })
+    },
+    startArchive(info) {
+      const archiveSpan = Sentry.startNewTrace(() =>
+        Sentry.startInactiveSpan({
+          name: 'ai.archive',
+          op: 'ai.archive',
+          forceTransaction: true,
+          parentSpan: null,
+          startTime: info.startTime,
+          attributes: { game_session_id: info.gameSessionId }
+        })
+      )
+      archives.set(info.archiveId, {
+        archiveSpan,
+        attempts: new Set(),
+        ended: false
+      })
+      return true
+    },
+    endArchive(info) {
+      later(() => {
+        const state = archives.get(info.archiveId)
+        if (state == null || state.ended) return
+        state.ended = true
+        captureArchiveException(state.archiveSpan, info.exception)
+        setSpanAttr(state.archiveSpan, 'attempt_count', info.attemptCount)
+        setSpanAttr(state.archiveSpan, 'category', info.category)
+        setSpanAttr(state.archiveSpan, 'reason', info.reason)
+        let archiveOK: boolean | undefined
+        if (info.ok === true) archiveOK = true
+        else if (info.ok === false || info.exception) archiveOK = false
+        state.attempts.forEach((attemptId) => finishAttempt(attemptId, info.endTime, archiveOK))
+        endSpan(state.archiveSpan, info.endTime, archiveOK)
+        archives.delete(info.archiveId)
+      })
+    }
+  }
+}
 
 watch(runnerIframeRef, (iframe) => {
   if (iframe == null) return
@@ -272,6 +728,8 @@ async function prepareAIInteraction(
   iframeWindow.xbuilder_set_ai_description(aiDescription)
   iframeWindow.xbuilder_set_ai_interaction_api_endpoint(aiInteractionEndpoint)
   iframeWindow.xbuilder_set_ai_interaction_api_token_provider(async () => (await ensureAccessToken()) ?? '')
+  iframeWindow.xbuilder_set_game_session_id(crypto.randomUUID())
+  iframeWindow.xbuilder_set_sentry_bridge(createAISentryBridge())
   reporter.report(1)
   return
 }
