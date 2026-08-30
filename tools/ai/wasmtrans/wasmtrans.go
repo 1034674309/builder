@@ -124,7 +124,7 @@ func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []b
 		"signal":  controller.Get("signal"),
 	}))
 	if err != nil {
-		return ai.AnnotateTransportError(ctx, fmt.Errorf("failed to fetch: %w", err))
+		return fmt.Errorf("failed to fetch: %w", err)
 	}
 
 	if !jsResp.Get("ok").Bool() {
@@ -135,15 +135,15 @@ func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []b
 		bodyText, bodyErr := responseBody(ctx, jsResp)
 		if bodyErr != nil {
 			fallback := fmt.Errorf("failed to fetch with status %d %s (and failed to read error body: %w)", status, statusText, bodyErr)
-			return ai.AnnotateTransportError(ctx, ai.ErrorFromHTTPResponse(status, retryAfter, "", fallback))
+			return ai.ErrorFromHTTPResponse(status, retryAfter, "", fallback)
 		}
 		fallback := fmt.Errorf("failed to fetch with status %d %s: %s", status, statusText, bodyText)
-		return ai.AnnotateTransportError(ctx, ai.ErrorFromHTTPResponse(status, retryAfter, bodyText, fallback))
+		return ai.ErrorFromHTTPResponse(status, retryAfter, bodyText, fallback)
 	}
 
 	bodyText, err := responseBody(ctx, jsResp)
 	if err != nil {
-		return ai.AnnotateTransportError(ctx, fmt.Errorf("failed to process json response: %w", err))
+		return fmt.Errorf("failed to process json response: %w", err)
 	}
 	if err := json.Unmarshal([]byte(bodyText), result); err != nil {
 		return fmt.Errorf("failed to unmarshal response json: %w", err)

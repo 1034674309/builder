@@ -198,12 +198,10 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 				break
 			}
 
-			timeoutCtx, cancel := stdContext.WithTimeout(thinkCtx, transportTimeout)
-			attemptCtx := startAttempt(timeoutCtx)
+			attemptCtx, cancel := stdContext.WithTimeout(thinkCtx, transportTimeout)
 			attemptCount++
 			lastAttempt = attempt
 			resp, lastErr = currentTransport.Interact(attemptCtx, request)
-			lastErr = AnnotateTransportError(attemptCtx, lastErr)
 			cancel()
 			if lastErr == nil {
 				break
@@ -420,10 +418,8 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 		}
 
 		attemptCtx, cancel := stdContext.WithTimeout(archiveCtx, archiveTimeout)
-		attemptCtx = startArchiveAttempt(attemptCtx)
 		attemptCount++
 		archived, lastErr = transport.Archive(attemptCtx, turnsToArchive, existingArchive)
-		lastErr = AnnotateTransportError(attemptCtx, lastErr)
 		cancel()
 		if lastErr == nil {
 			break

@@ -36,7 +36,7 @@ Sentry SDK 在父页面运行。WASM 只通知开始、结束和请求信息；�
 
 `startThink` / `startArchive` 同步登记 root，并把内部 ID 写入对应的 Go context。其它桥调用异步执行，避免在 WASM 的同步调用栈上操作 Sentry。
 
-每次 `Transport.Interact` 或 `Transport.Archive` 都会生成一个新的 `attempt_id`。`fetchAI` 下一拍创建 `http.client`，从这个 client 生成 `Sentry-Trace` 和 `Baggage`，再调用浏览器 `fetch`。请求完成后才结束 client span。
+默认 Transport 通过 `NewSentryTransport` 包装。每次 `Transport.Interact` 或 `Transport.Archive` 都由 wrapper 生成一个新的 `attempt_id`，并在各自的 context 中保存，避免并发请求互相覆盖。`fetchAI` 下一拍创建 `http.client`，从这个 client 生成 `Sentry-Trace` 和 `Baggage`，再调用浏览器 `fetch`。请求完成后才结束 client span。
 
 浏览器响应 body 只读取一次，转换成普通对象后交给 WASM：
 
@@ -48,7 +48,7 @@ WASM 继续负责解析成功响应和错误 JSON。取消请求时，Go context
 
 ## Think 的结束状态
 
-`ai.think` 在结束时写入 `outcome`、`turn_count` 和 `attempt_count`。只有真正失败才上报一条 exception。
+`ai.think` 在所有重试结束后写入 `outcome`、`turn_count` 和 `attempt_count`。只有最终确认为失败时才上报一条 exception，因此一次 Think 最多产生一条 exception。
 
 | 状态 | 含义 | exception |
 | --- | --- | --- |
@@ -72,13 +72,11 @@ Archive 规则类似：取消和额度结束只结束 span；非取消的重试�
 - `first_meaningful_delta_ms`：模型返回第一个有效内容或 tool call 的耗时。
 - `category` / `reason`：后端对失败的分类标签。
 
-后端失败响应使用统一格式：
+后端直接把 `category`、`reason` 和 `request_id` 写到当前 `http.server` transaction，不把这些仅用于排查的字段复制到公共 HTTP 错误响应。
 
-```json
-{"category":"model_response_invalid","reason":"no_choices","request_id":"..."}
-```
+后端失败时只把对应 transaction 标为 error，不直接 `CaptureException`。一个 Think/Archive 可能包含多次 HTTP 重试；如果后端每次失败都上报 exception，同一次最终失败会产生多条 Issue 事件。最终是否失败只有前端流程知道，因此由前端在所有重试结束后至多上报一次 exception。后端 transaction 保留每次模型调用的根因和现场，前端 exception 表示整次 Think/Archive 的最终结果。
 
-后端只把 transaction 标为 error 并返回分类，不直接 `CaptureException`。这样后端的重试不会为同一个问题产生多条 Issue，最终是否上报 exception 由前端流程决定。
+前端 exception 使用前端流程自己的 `category` / `reason`，不复制后端分类。排查时通过同一条 trace，从最终 exception 进入对应的后端 transaction 查看精确根因和 `request_id`。
 
 ### 失败分类
 
@@ -118,4 +116,4 @@ body 放在 data/context 中，不放在 tag 中。短字段使用 tag，便于�
 
 ## 当前范围
 
-已完成 Think/Archive trace、浏览器 client、后端 server 现场、终态和失败合同。生产采样率调整、精灵名 tag、Copilot 采集、完整模型 messages 和 SSE 内容不在本文范围内。
+已完成 Think/Archive trace、浏览器 client、后端 server 现场、终态和失败标签。生产采样率调整、精灵名 tag、Copilot 采集、完整模型 messages 和 SSE 内容不在本文范围内。

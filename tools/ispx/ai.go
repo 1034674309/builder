@@ -145,8 +145,9 @@ func resetAIDefaultTransport() {
 	if aiInteractionAPIEndpoint == "" || aiInteractionAPITokenProvider == nil {
 		return
 	}
-	ai.SetDefaultTransport(wasmtrans.New(
+	transport := wasmtrans.New(
 		wasmtrans.WithEndpoint(aiInteractionAPIEndpoint),
 		wasmtrans.WithTokenProvider(aiInteractionAPITokenProvider),
-	))
+	)
+	ai.SetDefaultTransport(ai.NewSentryTransport(transport))
 }
