@@ -17,7 +17,7 @@ export type SentryConfig = {
   dsn: string
   tracesSampleRate: number
   lspSampleRate: number
-  aiSampleRate: number
+  ispxSampleRate: number
 }
 
 export function initSentry(app: VueApp<Element>, router: Router | undefined, config: SentryConfig) {
@@ -45,9 +45,9 @@ export function initSentry(app: VueApp<Element>, router: Router | undefined, con
     environment: process.env.NODE_ENV,
     tracesSampler: (samplingContext) => {
       const { name, inheritOrSampleWith } = samplingContext
-      // Independent AI roots must not inherit pageload sampling (#1826).
+      // Independent iSPX roots must not inherit pageload sampling (#1826).
       if (isAIOperation(name)) {
-        return config.aiSampleRate
+        return config.ispxSampleRate
       }
       if (isLSPOperation(name) || isCodeEditorOperation(name)) {
         return config.lspSampleRate
