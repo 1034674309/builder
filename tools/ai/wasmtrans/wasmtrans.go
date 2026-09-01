@@ -105,7 +105,7 @@ func (t *wasmTransport) buildHeaders() map[string]any {
 
 // fetchAndParse performs a fetch request and parses the JSON response into the target.
 func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []byte, result any) error {
-	headers := t.buildHeaders()
+	headers := mergeExtraHeaders(t.buildHeaders(), ai.ExtraHeadersFromContext(ctx))
 
 	// Local AbortController covers the no-bridge native fetch path, where
 	// AbortAI is a no-op. When the bridge exists, AfterFunc still aborts
