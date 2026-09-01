@@ -91,17 +91,9 @@ func extractCommandSpec(cmdType reflect.Type) CommandSpec {
 // handler. It creates the command struct, populates its fields, calls the
 // handler, and processes the result.
 func callCommandHandler(ctx context.Context, owner any, info commandInfo, args map[string]any, turnIndex int) (result *CommandResult, err error) {
-	startCommand(ctx, turnIndex, info.spec.Name)
+	span := startCommand(ctx, turnIndex, info.spec.Name)
 	spanOK := false
-	defer func() {
-		errText := ""
-		if err != nil {
-			errText = err.Error()
-		} else if result != nil && result.ErrorMessage != "" {
-			errText = result.ErrorMessage
-		}
-		endCommand(ctx, spanOK, errText)
-	}()
+	defer func() { endCommand(span, spanOK) }()
 
 	// Create a new zero value of the command struct type (T).
 	cmdType := info.typ

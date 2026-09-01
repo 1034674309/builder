@@ -76,6 +76,9 @@ func commandDetail(name string, args map[string]any) (string, string) {
 // archiveFinish is the terminal state sent once through endArchive.
 // Archive has no outcome field.
 type archiveFinish struct {
+	outcome          string
+	category         string
+	reason           string
 	ok               bool
 	captureException bool
 	attemptCount     int

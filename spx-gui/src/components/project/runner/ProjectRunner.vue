@@ -300,6 +300,8 @@ function mergeAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal
   return merged.signal
 }
 
+// Kept only until the legacy bridge implementation is removed in the cleanup commit.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function createAISentryBridge(): AISentryBridge {
   type InactiveSpan = ReturnType<typeof Sentry.startInactiveSpan>
   type AttemptState = {
@@ -765,7 +767,6 @@ async function prepareAIInteraction(
   iframeWindow.xbuilder_set_ai_interaction_api_endpoint(aiInteractionEndpoint)
   iframeWindow.xbuilder_set_ai_interaction_api_token_provider(async () => (await ensureAccessToken()) ?? '')
   iframeWindow.xbuilder_set_game_session_id(crypto.randomUUID())
-  iframeWindow.xbuilder_set_sentry_bridge(createAISentryBridge())
   installISPXRPCSession(iframeWindow)
   reporter.report(1)
   return

@@ -125,18 +125,18 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 		rateLimitWaitTimeout = 2 * time.Minute        // Maximum wait time for rate limiting.
 	)
 
+	thinkCtx := withTracer(ctx, tracerFromContext(ctx))
 	p.beginInteraction()
-	thinkCtx := ctx
 	var finish thinkFinish
+	thinkCtx, thinkSpan := startThink(thinkCtx)
 	defer func() {
-		endThink(thinkCtx, finish)
+		endThink(thinkSpan, finish)
 		p.endInteraction()
 		if ctx.Err() != nil {
 			return
 		}
-		p.scheduleHistoryManagement(owner)
+		p.scheduleHistoryManagement(owner, tracerFromContext(thinkCtx))
 	}()
-	thinkCtx = startThink(ctx)
 
 	var (
 		currentMsg     = msg
@@ -367,10 +367,10 @@ func (p *Player) appendHistory(turn Turn) {
 // scheduleHistoryManagement starts history management in an owner-scoped
 // coroutine so it can outlive the caller without outliving its owner. The
 // blocking archive work runs natively to avoid blocking the game engine.
-func (p *Player) scheduleHistoryManagement(owner any) {
+func (p *Player) scheduleHistoryManagement(owner any, tracer Tracer) {
 	spx.Go(owner, func(ctx stdContext.Context, _ any) {
 		spx.ExecuteNative(func(_ stdContext.Context, _ any) {
-			p.manageHistory(ctx)
+			p.manageHistory(withTracer(ctx, tracer))
 		})
 	})
 }
@@ -393,9 +393,9 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 
 	// Perform archive with retries.
 	transport := p.transport()
-	archiveCtx := startArchive(ctx)
+	archiveCtx, archiveSpan := startArchive(ctx)
 	var finish archiveFinish
-	defer func() { endArchive(archiveCtx, finish) }()
+	defer func() { endArchive(archiveSpan, finish) }()
 	var (
 		archived     ArchivedHistory
 		lastErr      error
@@ -431,19 +431,28 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 		rateGate.Observe(lastErr)
 	}
 	if err := ctx.Err(); err != nil {
-		finish = archiveFinish{attemptCount: attemptCount}
+		finish = archiveFinish{outcome: outcomeCancelled, attemptCount: attemptCount}
 		log.Printf("archive history canceled: %v", err)
 		p.cancelArchive()
 		return
 	}
 	if isQuotaExceeded(lastErr) {
-		finish = archiveFinish{attemptCount: attemptCount}
+		finish = archiveFinish{outcome: outcomeQuotaExhausted, attemptCount: attemptCount}
 		log.Printf("archive history stopped: %v", lastErr)
+		p.cancelArchive()
+		return
+	}
+	if isTooManyRequests(lastErr) {
+		finish = archiveFinish{outcome: outcomeRateLimited, attemptCount: attemptCount}
+		log.Printf("archive history rate limited: %v", lastErr)
 		p.cancelArchive()
 		return
 	}
 	if lastErr != nil {
 		finish = archiveFinish{
+			outcome:          outcomeFailure,
+			category:         categoryArchiveFailure,
+			reason:           reasonRetriesExhausted,
 			captureException: true,
 			attemptCount:     attemptCount,
 			errMessage:       lastErr.Error(),
@@ -453,7 +462,7 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 		return
 	}
 
-	finish = archiveFinish{ok: true, attemptCount: attemptCount}
+	finish = archiveFinish{outcome: outcomeSuccess, ok: true, attemptCount: attemptCount}
 	p.applyArchive(archived.Content, len(turnsToArchive))
 }
 

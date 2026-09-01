@@ -89,8 +89,7 @@ func (t *wasmTransport) Archive(ctx context.Context, turns []ai.Turn, existingAr
 	return resp, nil
 }
 
-// buildHeaders creates request headers with proper authentication. The parent
-// page's fetchAI bridge creates the client span and adds trace headers.
+// buildHeaders creates request headers with proper authentication.
 func (t *wasmTransport) buildHeaders() map[string]any {
 	headers := map[string]any{
 		"Content-Type": "application/json",
@@ -107,17 +106,13 @@ func (t *wasmTransport) buildHeaders() map[string]any {
 func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []byte, result any) error {
 	headers := mergeExtraHeaders(t.buildHeaders(), ai.ExtraHeadersFromContext(ctx))
 
-	// Local AbortController covers the no-bridge native fetch path, where
-	// AbortAI is a no-op. When the bridge exists, AfterFunc still aborts
-	// this signal and also asks the parent page to abort.
 	controller := js.Global().Get("AbortController").New()
 	stopAbort := context.AfterFunc(ctx, func() {
 		controller.Call("abort")
-		ai.AbortAI(ctx)
 	})
 	defer stopAbort()
 
-	jsResp, err := awaitPromise(ctx, ai.FetchAI(ctx, t.endpoint+path, map[string]any{
+	jsResp, err := awaitPromise(ctx, js.Global().Call("fetch", t.endpoint+path, map[string]any{
 		"method":  "POST",
 		"headers": headers,
 		"body":    string(body),

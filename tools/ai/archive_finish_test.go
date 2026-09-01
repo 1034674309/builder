@@ -124,7 +124,7 @@ func TestPlayerArchiveFinish(t *testing.T) {
 		}
 	})
 
-	t.Run("RateLimitedRetriesExhaustedCaptures", func(t *testing.T) {
+	t.Run("RateLimitedNoException", func(t *testing.T) {
 		lastArchiveFinish = archiveFinish{}
 		archiveCalls := 0
 		SetDefaultTransport(&mockTransport{
@@ -138,11 +138,14 @@ func TestPlayerArchiveFinish(t *testing.T) {
 		if archiveCalls != 3 {
 			t.Fatalf("archive calls = %d, want 3", archiveCalls)
 		}
-		if !lastArchiveFinish.shouldCaptureException() {
-			t.Fatal("archive 429 exhausted must capture")
+		if lastArchiveFinish.shouldCaptureException() {
+			t.Fatal("archive 429 must not capture")
 		}
 		if lastArchiveFinish.attemptCount != 3 {
 			t.Fatalf("attemptCount = %d", lastArchiveFinish.attemptCount)
+		}
+		if lastArchiveFinish.outcome != outcomeRateLimited {
+			t.Fatalf("outcome = %q; want rate_limited", lastArchiveFinish.outcome)
 		}
 	})
 }

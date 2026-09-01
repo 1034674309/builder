@@ -4,9 +4,6 @@ package ai
 
 import "context"
 
-// SetGameSessionID is a no-op outside the WASM runner.
-func SetGameSessionID(string) {}
-
 var (
 	lastThinkFinish    thinkFinish
 	thinkFinishCount   int
@@ -21,24 +18,16 @@ func resetSentryStub() {
 	archiveFinishCount = 0
 }
 
-func startThink(ctx context.Context) context.Context { return ctx }
-
-func endThink(_ context.Context, finish thinkFinish) {
+func observeThinkFinish(finish thinkFinish) {
 	thinkFinishCount++
 	lastThinkFinish = finish
 }
 
-func startAttempt(ctx context.Context) context.Context { return ctx }
-
-func startCommand(context.Context, int, string) {}
-
-func endCommand(context.Context, bool, string) {}
-
-func startArchive(ctx context.Context) context.Context { return ctx }
-
-func endArchive(_ context.Context, finish archiveFinish) {
+func observeArchiveFinish(finish archiveFinish) {
 	archiveFinishCount++
 	lastArchiveFinish = finish
 }
+
+func startAttempt(ctx context.Context) context.Context { return ctx }
 
 func startArchiveAttempt(ctx context.Context) context.Context { return ctx }

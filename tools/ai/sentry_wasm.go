@@ -9,42 +9,12 @@ import (
 )
 
 var (
-	gameSessionID string
-	sentryBridge  js.Value
+	sentryBridge js.Value
 )
-
-// SetGameSessionID stores the current game run id injected by the parent page.
-func SetGameSessionID(id string) {
-	gameSessionID = id
-}
 
 // SetSentryBridge stores the parent-page Sentry hook object.
 func SetSentryBridge(bridge js.Value) {
 	sentryBridge = bridge
-}
-
-func startThink(ctx context.Context) context.Context {
-	return startRoot(ctx, "startThink", "thinkId", gameSessionID)
-}
-
-func endThink(ctx context.Context, finish thinkFinish) {
-	id := interactionIDFromContext(ctx)
-	if id == "" {
-		return
-	}
-	callArgs := map[string]any{
-		"thinkId":      id,
-		"endTime":      unixSeconds(),
-		"outcome":      finish.outcome,
-		"category":     finish.category,
-		"reason":       finish.reason,
-		"turnCount":    finish.turnCount,
-		"attemptCount": finish.attemptCount,
-	}
-	if payload := finish.bridgeException(gameSessionID); payload != nil {
-		callArgs["exception"] = payload
-	}
-	callBridge("endThink", callArgs)
 }
 
 func startAttempt(ctx context.Context) context.Context {
@@ -64,61 +34,13 @@ func startNamedAttempt(ctx context.Context, idKey string) context.Context {
 	return withAttemptID(ctx, attemptID)
 }
 
-func startCommand(ctx context.Context, turnIndex int, commandName string) {
-	thinkID := interactionIDFromContext(ctx)
-	if thinkID == "" {
-		return
-	}
-	callBridge("startCommand", map[string]any{
-		"thinkId":     thinkID,
-		"startTime":   unixSeconds(),
-		"turnIndex":   turnIndex,
-		"commandName": commandName,
-	})
-}
-
-func endCommand(ctx context.Context, ok bool, errorMessage string) {
-	thinkID := interactionIDFromContext(ctx)
-	if thinkID == "" {
-		return
-	}
-	callBridge("endCommand", map[string]any{
-		"thinkId":      thinkID,
-		"endTime":      unixSeconds(),
-		"ok":           ok,
-		"errorMessage": errorMessage,
-	})
-}
-
-func startArchive(ctx context.Context) context.Context {
-	return startRoot(ctx, "startArchive", "archiveId", gameSessionID)
-}
-
-func endArchive(ctx context.Context, finish archiveFinish) {
-	id := interactionIDFromContext(ctx)
-	if id == "" {
-		return
-	}
-	callArgs := map[string]any{
-		"archiveId":    id,
-		"endTime":      unixSeconds(),
-		"attemptCount": finish.attemptCount,
-	}
-	if finish.ok {
-		callArgs["ok"] = true
-	}
-	if payload := finish.bridgeException(gameSessionID); payload != nil {
-		callArgs["exception"] = payload
-		callArgs["category"] = categoryArchiveFailure
-		callArgs["reason"] = reasonRetriesExhausted
-		callArgs["ok"] = false
-	}
-	callBridge("endArchive", callArgs)
-}
-
 func startArchiveAttempt(ctx context.Context) context.Context {
 	return startNamedAttempt(ctx, "archiveId")
 }
+
+func observeThinkFinish(thinkFinish) {}
+
+func observeArchiveFinish(archiveFinish) {}
 
 func startRoot(ctx context.Context, method, idKey, gameSessionId string) (out context.Context) {
 	out = ctx
