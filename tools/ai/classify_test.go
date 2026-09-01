@@ -41,9 +41,6 @@ func TestClassifyCommandStopFromHandler(t *testing.T) {
 		if isHandlerPanic(err) {
 			t.Fatal("typed as handler panic")
 		}
-		if got := commandNameFromError(err); got != "classifyMoveCmd" {
-			t.Fatalf("commandNameFromError() = %q", got)
-		}
 		category, reason, ok := classifyCommandStop(err)
 		if !ok || category != categoryModelQualityFailure || reason != reasonInvalidArguments {
 			t.Fatalf("classifyCommandStop() = %q, %q, %v", category, reason, ok)
@@ -67,9 +64,6 @@ func TestClassifyCommandStopFromHandler(t *testing.T) {
 		}
 		if isInvalidArguments(err) {
 			t.Fatal("typed as invalid arguments")
-		}
-		if got := commandNameFromError(err); got != "classifyMoveCmd" {
-			t.Fatalf("commandNameFromError() = %q", got)
 		}
 		category, reason, ok := classifyCommandStop(err)
 		if !ok || category != categoryRuntimeFailure || reason != reasonHandlerPanic {
@@ -110,8 +104,5 @@ func TestClassifyCommandStopUnwraps(t *testing.T) {
 	category, reason, ok := classifyCommandStop(wrapped)
 	if !ok || category != categoryModelQualityFailure || reason != reasonInvalidArguments {
 		t.Fatalf("classifyCommandStop() = %q, %q, %v", category, reason, ok)
-	}
-	if got := commandNameFromError(wrapped); got != "GoTo" {
-		t.Fatalf("commandNameFromError() = %q", got)
 	}
 }

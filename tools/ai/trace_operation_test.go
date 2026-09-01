@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 type operationTraceContextKey struct{}
@@ -291,6 +292,87 @@ func TestArchiveTraceFinalFailureRecordsOnce(t *testing.T) {
 	}
 	if traceContainsValue(recorder, "private archive detail") {
 		t.Fatal("trace must not contain archive error text")
+	}
+}
+
+func TestArchiveTraceExpectedOutcomesDoNotRecordError(t *testing.T) {
+	tests := []struct {
+		name    string
+		ctx     func(*testing.T) context.Context
+		result  ArchivedHistory
+		err     error
+		outcome string
+		status  SpanStatus
+		calls   int
+	}{
+		{
+			name:    "Success",
+			ctx:     func(t *testing.T) context.Context { return t.Context() },
+			result:  ArchivedHistory{Content: "summary"},
+			outcome: outcomeSuccess,
+			status:  SpanStatusOK,
+			calls:   1,
+		},
+		{
+			name:    "Quota",
+			ctx:     func(t *testing.T) context.Context { return t.Context() },
+			err:     &QuotaExceededError{Err: errors.New("quota")},
+			outcome: outcomeQuotaExhausted,
+			status:  SpanStatusUnset,
+			calls:   1,
+		},
+		{
+			name:    "RateLimited",
+			ctx:     func(t *testing.T) context.Context { return t.Context() },
+			err:     &TooManyRequestsError{RetryAfter: time.Millisecond, Err: errors.New("429")},
+			outcome: outcomeRateLimited,
+			status:  SpanStatusUnset,
+			calls:   3,
+		},
+		{
+			name: "Cancelled",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			outcome: outcomeCancelled,
+			status:  SpanStatusUnset,
+			calls:   0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &operationTraceRecorder{}
+			calls := 0
+			base := &mockTransport{ArchiveFunc: func(context.Context, []Turn, string) (ArchivedHistory, error) {
+				calls++
+				return tt.result, tt.err
+			}}
+			setupOperationTraceTest(t, recorder, NewTraceTransport(base))
+			player := playerReadyToArchive()
+			player.manageHistory(tt.ctx(t))
+
+			if calls != tt.calls {
+				t.Fatalf("transport calls = %d; want %d", calls, tt.calls)
+			}
+			archive := onlyOperationSpan(t, recorder, archiveSpanName)
+			assertOperationEnd(t, archive, tt.status, tt.outcome, 0)
+			if tt.outcome == outcomeSuccess && player.archivedHistory != "summary" {
+				t.Fatalf("archived history = %q; want summary", player.archivedHistory)
+			}
+		})
+	}
+}
+
+func playerReadyToArchive() *Player {
+	history := make([]Turn, 30)
+	for i := range history {
+		history[i].IsInitial = i%10 == 0
+	}
+	return &Player{
+		errorHandler: func(error) {},
+		history:      history,
 	}
 }
 

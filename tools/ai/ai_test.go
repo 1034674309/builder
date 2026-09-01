@@ -145,15 +145,6 @@ func TestPlayerThinkQuotaExceededDoesNotRetry(t *testing.T) {
 	default:
 		t.Fatal("quota did not trigger error handler")
 	}
-	if lastThinkFinish.outcome != outcomeQuotaExhausted {
-		t.Fatalf("outcome = %q, want %s", lastThinkFinish.outcome, outcomeQuotaExhausted)
-	}
-	if lastThinkFinish.attemptCount != 1 {
-		t.Fatalf("attemptCount = %d, want 1", lastThinkFinish.attemptCount)
-	}
-	if lastThinkFinish.shouldCaptureException() || lastThinkFinish.bridgeException("s") != nil {
-		t.Fatal("quota must not capture exception")
-	}
 }
 
 func TestPlayerAppendHistory(t *testing.T) {

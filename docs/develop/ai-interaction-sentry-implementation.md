@@ -1,115 +1,105 @@
 # AI Interaction Sentry Implementation
 
-本文是 [AI Interaction Sentry](./ai-interaction-sentry.md) 的实现索引。它说明代码在哪里、请求如何经过各层，以及提交前如何验证。
+本文是 [AI Interaction Sentry](./ai-interaction-sentry.md) 的实现索引，说明通用 Trace、JSON-RPC、Web adapter 和 WASM HTTP 之间的边界。
 
 ## 代码分布
 
-### Builder 前端
+### 通用 AI 层
 
 | 文件 | 作用 |
 | --- | --- |
-| `spx-gui/src/components/project/runner/ProjectRunner.vue` | 在父页面创建 `ai.think`、`ai.archive`、`http.client` 和 command span；负责 fetch、trace headers、响应转换和取消 |
-| `spx-gui/src/setup/sentry.ts` | 排除 AI URL 的自动 fetch tracing，并为 `ai.*` 使用独立采样率 |
-| `spx-gui/src/utils/tracing.ts` | 提供 `isAIOperation`，供采样器识别 AI root |
-| `tools/ai/ai.go` | Think/Archive 的循环、重试、取消、command 执行和终态收口 |
-| `tools/ai/sentry_transport.go` | 包装底层 Transport，统一登记每次 attempt，并修正超时等通用传输错误 |
-| `tools/ai/sentry_wasm.go` / `sentry_stub.go` | WASM 桥和非 WASM 测试用空实现 |
-| `tools/ai/sentry_context.go` | 把 Think/Archive ID 和 `attempt_id` 放入 context，隔离并发请求 |
-| `tools/ai/wasmtrans/wasmtrans.go` | 序列化请求、调用 `FetchAI`、只读一次响应 body，并解析错误/成功 JSON |
-| `tools/ai/classify.go` / `exception.go` / `httperr.go` | 终态、异常和 HTTP 错误的分类规则 |
-| `tools/ai/command.go` | command span，以及参数错误、handler panic 和普通 handler error 的分流 |
-| `tools/ispx/ai.go` | 把 game session ID 和 Sentry bridge 注入 WASM |
+| `tools/ai/trace.go` | 定义 `Tracer`、`Span`、`SpanInfo`、`SpanEnd`、`ErrorInfo` 和 Noop 实现 |
+| `tools/ai/trace_operation.go` | 创建并结束 Think、Archive 和 Command span；最终失败只记录 `category/reason` |
+| `tools/ai/trace_transport.go` | 每次真实 Transport 调用创建一个 `http.client`；失败只设置 span 状态 |
+| `tools/ai/transport_context.go` | 在 context 中复制保存不透明 extra headers |
+| `tools/ai/ai.go` / `classify.go` | Think/Archive 重试、取消、Tracer 快照和终态分类 |
+| `tools/ai/command.go` | Command 执行及参数错误、handler panic、普通 handler error 的分流 |
+| `tools/ai/wasmtrans/wasmtrans.go` | 合并 extra headers、执行原生 `window.fetch`、处理取消并解析响应 |
+
+`tools/ai` 中的通用 Trace 代码不依赖 `js.Value`、JSON-RPC、Sentry header 名称或 Web bridge；浏览器 API 只存在于 `wasmtrans` 子包。
+
+### iSPX RPC 层
+
+| 文件 | 作用 |
+| --- | --- |
+| `tools/ispx/internal/rpc/client.go` | 通用 `Call` / `Notify` / `HandleMessage` / `Close`、pending 匹配和取消 |
+| `tools/ispx/rpc_wasm.go` | 暴露通用 message replier 和 response 入口，按 session 安装或关闭 Tracer |
+| `tools/ispx/trace.go` | 用 `trace/span.start`、`trace/span.error`、`trace/span.end` 实现 `ai.Tracer` |
+| `tools/ispx/ai.go` | 安装 `NewTraceTransport(wasmtrans.New(...))`，并注入 endpoint、token provider 和 game session ID |
+
+### Web 层
+
+| 文件 | 作用 |
+| --- | --- |
+| `spx-gui/src/ispx/rpc.ts` | 通用 JSON-RPC session、取消、关闭和迟到消息隔离 |
+| `spx-gui/src/ispx/sentry-trace-adapter.ts` | 消费通用 trace RPC，创建 Sentry span、返回 propagation headers、记录固定 exception |
+| `spx-gui/src/components/project/runner/ProjectRunner.vue` | 创建、注入和关闭当前运行的 RPC session |
+| `spx-gui/src/setup/sentry.ts` | 排除 AI URL 的自动 fetch tracing，并使用 `ispxSampleRate` 采样 AI root |
 
 ### Builder backend
 
-| 文件 | 作用 |
-| --- | --- |
-| `internal/aiinteraction/aiinteraction.go` | 流式调用模型，计算首个有效响应耗时，并把模型 metadata 写到 HTTP transaction |
-| `internal/aiinteraction/failure.go` | 校验 completion/Archive 结果并生成统一的 `category` 和 `reason` |
-| `cmd/xbuilder-backend/middleware.go` | 创建 `http.server` transaction，并按路由捕获原始 request/response body、限制 Sentry 副本大小和记录截断信息 |
+后端不在本次前端重构范围内。现有 `http.server` middleware 继续捕获 AI API 的 request/response body，并由 AI interaction 逻辑记录模型 request ID、TTFT 和失败标签。
 
-## 一次 Think 请求怎么走
+## 一次 Think 请求
 
 ```text
 Player.Think
-  -> tools/ai/ai.go
-  -> startThink(context)
-  -> sentryTransport.Interact
-  -> register attempt in context
+  -> start ai.think through ai.Tracer
+  -> TraceTransport.Interact
+  -> RPCTracer.StartSpan(http.client)
+  -> trace/span.start over generic JSON-RPC
+  -> Web Sentry adapter creates child span
+  <- { spanId, headers: { Sentry-Trace, Baggage } }
+  -> ai.WithExtraHeaders(request context)
   -> wasmtrans.Interact
-  -> wasmtrans.fetchAndParse
-  -> ai.FetchAI
-  -> ProjectRunner.fetchAI
-  -> create http.client + window.fetch
-  -> backend http.server
-  -> backend existing http.client (model)
-  -> response body returned to WASM
-  -> ai.go handles retry/command/finish
-  -> endThink
+  -> window.fetch with merged headers
+  -> backend http.server and existing model http.client
+  -> TraceTransport ends client span
+  -> ai.go handles retry / command / finish
+  -> root records at most one final error and ends
 ```
 
-Archive 走同一条请求路径，但从 `startArchive` 开始，使用自己的 root 和 context。
+Archive 使用相同链路，但以独立的 `ai.archive` root 开始。
 
-### 请求关联
+## 关键约定
 
-`startThink` / `startArchive` 创建的 interaction ID 和每次请求的 `attempt_id` 只存在于 Go context 与父页面 Map 中：
+- `TraceTransport` 不创建 attempt span；一次底层 `Interact` / `Archive` 调用对应一个 `http.client`。
+- `rateGate.Wait` 发生在 Transport 调用之前，因此等待失败不会创建 client span。
+- RPC 的短超时只用于 `RPCTracer.StartSpan`。成功的 span context 从原始请求 context 派生，不从短超时 context 派生。
+- root 创建失败后使用 Noop Tracer 继续当前操作，避免后续每次请求重复等待 RPC 超时。
+- 同一次 Think 快照一个 Tracer；异步 Archive 在新的 owner context 中只继承这份 Tracer。
+- RPC session 关闭后拒绝新请求、完成 pending call、忽略迟到 response；Web 同时结束残留 span。
+- Web 只返回 propagation headers，不接收 AI HTTP body，也不执行 fetch。
+- `wasmtrans` 仍拥有 endpoint、token、JSON、HTTP status、`Retry-After`、原生 `Response` 和 `AbortController`。
+- extra headers 写入和读取都复制 map；受保护 header 名称按大小写不敏感比较，不能被覆盖。
+- client 失败只结束为 `StatusError`。最终 Think/Archive failure 才 `RecordError` 一次。
+- `RecordError` 只携带 `category/reason`；Web 生成固定 exception，不接收原始错误、prompt、command args、token 或 body。
 
-```text
-think_id / archive_id -> root span
-attempt_id             -> 当前 fetch 和 client span
-```
-
-它们不作为 Sentry 字段发送。真正发给后端的 `Sentry-Trace` 和 `Baggage` 由前端 `http.client` 生成。
-
-## 重要实现约定
-
-- Think/Archive root 必须同步登记，因为 WASM 需要立即拿到 context 关联信息。
-- 默认 WASM Transport 在 `SetDefaultTransport` 前由 `NewSentryTransport` 包装；wrapper 不保存单次请求状态，attempt ID 只放在各自的 context 中。
-- 其它桥操作使用 `setTimeout(0)`，避免同步调用 Sentry 影响 WASM 栈展开。
-- `fetchAI` 在下一拍创建 client，并在完整读取 response body 后结束 client。
-- AI URL 已从浏览器自动 fetch tracing 中排除，否则同一个请求会生成重复 client。
-- body 只在前端读取一次；WASM 同时兼容 bridge 返回的普通对象和无 bridge 时的原生 `Response`。
-- Sentry 操作失败时回退到普通 fetch，不影响 AI 功能。
-- 后端不创建 `ai.upstream`，也不修改共用 `http.client` 的完成时机。
-- 后端失败只标记 `http.server` transaction 并记录根因标签；这些标签不通过公共错误响应传给前端。前端使用自己的终态分类，在所有重试结束后至多上报一次最终 exception，并通过同一条 trace 关联后端根因。
-
-## 验证
-
-Builder AI Go/WASM：
+## 验证命令
 
 ```sh
 cd tools/ai
 go test ./...
 GOOS=js GOARCH=wasm go build ./...
-```
 
-Builder backend：
+cd ../ispx
+go test ./...
+GOOS=js GOARCH=wasm go build ./...
 
-```sh
-go test ./internal/aiinteraction ./cmd/xbuilder-backend
-```
-
-前端：
-
-```sh
-cd spx-gui
+cd ../../spx-gui
+pnpm type-check
+pnpm vitest --run src/ispx/rpc.test.ts src/ispx/sentry-trace-adapter.test.ts
 pnpm build
+
+git diff --check
 ```
 
-改动 `tools/ai` 或 `tools/ispx` 后，需要重新编译 WASM 并更新 `spx-gui` 使用的 `ispx.wasm`。
+浏览器验收 success、retry、final failure、quota、429、cancel、Archive、rerun 和并发 Player，并确认请求携带 `Sentry-Trace/Baggage`。
 
-真机验收时建议检查：
+## 不在本次实现中
 
-- 两个角色同时 Think 时，每个 Think 都有自己的 root 和 client。
-- 成功 Think 的 `outcome` 为 `success`。
-- 后端 transaction 上有原始 `request_body` / `response_body`。
-- 后端失败 transaction 上有对应的 `category` / `reason`，有模型响应时还应有 `request_id`。
-- 取消、额度耗尽、429 重试用尽不会产生新的 exception。
-
-## 不在本次实现中的内容
-
-- 生产环境的 AI 采样率调整。
-- 精灵名和 `backend_*` 前端 tag。
-- Copilot 的 tracing 或公共 HTTP client 改造。
-- 完整 OpenAI messages、原始 SSE 内容和模型 prompt 的额外采集。
-- 独立的 `ai.transport.attempt`、`ai.upstream`、`ai.archive.upstream` span。
+- Builder backend 行为修改。
+- 生产环境采样率下调。
+- `traceparent` / `tracestate`。
+- Copilot tracing 或公共 HTTP client 改造。
+- prompt、command args、token、完整 OpenAI messages 或原始 SSE 的额外采集。

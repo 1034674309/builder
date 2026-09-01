@@ -144,7 +144,6 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 
 		hasExecutedAtLeastOneCommandInThisCall bool
 		attemptCount                           int
-		lastAttempt                            int
 	)
 	for i := range maxTurns {
 		turnCount := i + 1
@@ -183,7 +182,7 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 			lastErr  error
 			rateGate rateLimitGate
 		)
-		for attempt := range backoffAttempts(ctx, maxTransportAttempts, backoffBase, backoffCap) {
+		for range backoffAttempts(ctx, maxTransportAttempts, backoffBase, backoffCap) {
 			waitCtx, waitCancel := stdContext.WithTimeout(ctx, rateLimitWaitTimeout)
 			waitErr := rateGate.Wait(waitCtx)
 			waitCancel()
@@ -200,7 +199,6 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 
 			attemptCtx, cancel := stdContext.WithTimeout(thinkCtx, transportTimeout)
 			attemptCount++
-			lastAttempt = attempt
 			resp, lastErr = currentTransport.Interact(attemptCtx, request)
 			cancel()
 			if lastErr == nil {
@@ -218,7 +216,7 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 			return
 		}
 		if lastErr != nil {
-			finish = classifyTransportStop(lastErr).withCounts(turnCount, attemptCount).withException(msg, lastErr.Error(), i, lastAttempt, "", nil)
+			finish = classifyTransportStop(lastErr).withCounts(turnCount, attemptCount)
 			p.handleError(owner, fmt.Errorf("ai interaction failed after %d transport attempts: %w", maxTransportAttempts, lastErr))
 			return
 		}
@@ -240,7 +238,7 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 					outcome:  outcomeFailure,
 					category: categoryModelQualityFailure,
 					reason:   reasonMissingInitialCommand,
-				}.withCounts(turnCount, attemptCount).withException(msg, "ai did not provide an initial command or any command during the interaction", i, lastAttempt, "", nil)
+				}.withCounts(turnCount, attemptCount)
 				p.handleError(owner, errors.New("ai did not provide an initial command or any command during the interaction"))
 			} else {
 				finish = thinkFinish{outcome: outcomeSuccess}.withCounts(turnCount, attemptCount)
@@ -257,7 +255,7 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 			var err error
 			executedResult, err = callCommandHandler(thinkCtx, owner, cmdInfo, resp.CommandArgs, i)
 			if err != nil {
-				finish = classifyCommandStopFinish(err).withCounts(turnCount, attemptCount).withException(msg, err.Error(), i, lastAttempt, commandNameFromError(err), resp.CommandArgs)
+				finish = classifyCommandStopFinish(err).withCounts(turnCount, attemptCount)
 				p.handleError(owner, fmt.Errorf("failed to execute command %s: %w", resp.CommandName, err))
 				return
 			}
@@ -299,7 +297,7 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 		outcome:  outcomeFailure,
 		category: categoryModelQualityFailure,
 		reason:   reasonTurnLimit,
-	}.withCounts(maxTurns, attemptCount).withException(msg, fmt.Sprintf("ai interaction did not complete within %d turns", maxTurns), maxTurns-1, lastAttempt, "", nil)
+	}.withCounts(maxTurns, attemptCount)
 	p.handleError(owner, fmt.Errorf("ai interaction did not complete within %d turns", maxTurns))
 }
 
@@ -450,19 +448,17 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 	}
 	if lastErr != nil {
 		finish = archiveFinish{
-			outcome:          outcomeFailure,
-			category:         categoryArchiveFailure,
-			reason:           reasonRetriesExhausted,
-			captureException: true,
-			attemptCount:     attemptCount,
-			errMessage:       lastErr.Error(),
+			outcome:      outcomeFailure,
+			category:     categoryArchiveFailure,
+			reason:       reasonRetriesExhausted,
+			attemptCount: attemptCount,
 		}
 		log.Printf("failed to archive history after %d attempts: %v", maxArchiveAttempts, lastErr)
 		p.cancelArchive()
 		return
 	}
 
-	finish = archiveFinish{outcome: outcomeSuccess, ok: true, attemptCount: attemptCount}
+	finish = archiveFinish{outcome: outcomeSuccess, attemptCount: attemptCount}
 	p.applyArchive(archived.Content, len(turnsToArchive))
 }
 

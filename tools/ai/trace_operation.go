@@ -40,7 +40,7 @@ func startThink(ctx context.Context) (context.Context, Span) {
 }
 
 func endThink(span Span, finish thinkFinish) {
-	if finish.shouldCaptureException() {
+	if finish.outcome == outcomeFailure {
 		span.RecordError(ErrorInfo{Attributes: failureAttributes(finish.category, finish.reason)})
 	}
 	span.End(SpanEnd{
@@ -50,7 +50,6 @@ func endThink(span Span, finish thinkFinish) {
 			attemptCountAttr: finish.attemptCount,
 		}),
 	})
-	observeThinkFinish(finish)
 }
 
 func startCommand(ctx context.Context, turnIndex int, commandName string) Span {
@@ -91,7 +90,7 @@ func startArchive(ctx context.Context) (context.Context, Span) {
 }
 
 func endArchive(span Span, finish archiveFinish) {
-	if finish.shouldCaptureException() {
+	if finish.outcome == outcomeFailure {
 		span.RecordError(ErrorInfo{Attributes: failureAttributes(finish.category, finish.reason)})
 	}
 	span.End(SpanEnd{
@@ -100,7 +99,6 @@ func endArchive(span Span, finish archiveFinish) {
 			attemptCountAttr: finish.attemptCount,
 		}),
 	})
-	observeArchiveFinish(finish)
 }
 
 func operationStatus(outcome string) SpanStatus {

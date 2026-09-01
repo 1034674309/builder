@@ -2,8 +2,7 @@ package ai
 
 import "errors"
 
-// Frontend exception category / reason values from SENTRY_PLAN.
-// Backend HTTP error category/reason live on http.server, not a frontend attempt span.
+// AI operation terminal labels. Backend HTTP error labels live on http.server.
 const (
 	categoryTransportFailure    = "transport_failure"
 	categoryModelQualityFailure = "model_quality_failure"
@@ -22,23 +21,24 @@ const (
 	reasonNetwork               = "network"
 	reasonMissingInitialCommand = "missing_initial_command"
 	reasonTurnLimit             = "turn_limit"
-	reasonOther                 = "other"
 	reasonRetriesExhausted      = "retries_exhausted"
 )
 
-// thinkFinish is the terminal state sent once through endThink.
+// thinkFinish is the terminal state recorded once on the Think root span.
 type thinkFinish struct {
 	outcome      string
 	category     string
 	reason       string
 	turnCount    int
 	attemptCount int
-	turnIndex    int
-	lastAttempt  int
-	userMsg      string
-	commandName  string
-	commandArgs  map[string]any
-	errMessage   string
+}
+
+// archiveFinish is the terminal state recorded once on the Archive root span.
+type archiveFinish struct {
+	outcome      string
+	category     string
+	reason       string
+	attemptCount int
 }
 
 func (f thinkFinish) withCounts(turnCount, attemptCount int) thinkFinish {
@@ -48,7 +48,7 @@ func (f thinkFinish) withCounts(turnCount, attemptCount int) thinkFinish {
 }
 
 // invalidArgumentsError is returned when command args cannot populate the
-// handler struct. Think stops; Sentry reason is invalid_arguments.
+// handler struct. Think stops with reason invalid_arguments.
 type invalidArgumentsError struct {
 	command string
 	err     error
@@ -69,7 +69,7 @@ func (e *invalidArgumentsError) Unwrap() error {
 }
 
 // handlerPanicError is returned when a command handler panics (other than
-// AbortThread). Think stops; Sentry reason is handler_panic.
+// AbortThread). Think stops with reason handler_panic.
 type handlerPanicError struct {
 	command string
 	err     error
@@ -97,18 +97,6 @@ func isInvalidArguments(err error) bool {
 func isHandlerPanic(err error) bool {
 	var typed *handlerPanicError
 	return errors.As(err, &typed)
-}
-
-func commandNameFromError(err error) string {
-	var argsErr *invalidArgumentsError
-	if errors.As(err, &argsErr) {
-		return argsErr.command
-	}
-	var panicErr *handlerPanicError
-	if errors.As(err, &panicErr) {
-		return panicErr.command
-	}
-	return ""
 }
 
 func classifyCommandStop(err error) (category, reason string, ok bool) {
@@ -141,9 +129,6 @@ func classifyTransportStop(err error) thinkFinish {
 }
 
 func classifyCommandStopFinish(err error) thinkFinish {
-	category, reason, ok := classifyCommandStop(err)
-	if !ok {
-		return thinkFinish{outcome: outcomeFailure, category: categoryRuntimeFailure, reason: reasonOther}
-	}
+	category, reason, _ := classifyCommandStop(err)
 	return thinkFinish{outcome: outcomeFailure, category: category, reason: reason}
 }

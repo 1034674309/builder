@@ -1,119 +1,94 @@
 # AI Interaction Sentry
 
-本文定义 AI Interaction 在 Sentry 中记录什么，以及各层的职责。目标不是把所有请求内容都发到 Sentry，而是能回答三个问题：一次交互慢在哪里、为什么失败、失败时能否还原现场。
+本文定义 AI Interaction 的 trace 结构和各层职责。目标是定位一次 Think 或 Archive 慢在哪里、最终为什么失败，同时保持 AI HTTP 仍由 WASM Transport 执行。
 
 ## Trace 结构
 
-Think 和 Archive 各自是一条独立 trace，不挂在页面 pageload 上。浏览器和后端使用同一组 trace headers，所以一次 AI 请求可以从浏览器一直看到后端。
+Think 和 Archive 各自是一条独立 trace，不挂在页面 pageload 上。浏览器生成的 `Sentry-Trace` 和 `Baggage` 会随 WASM 发出的请求传到后端。
 
 ```text
 ai.think
-├── http.client              浏览器发往 Builder backend
+├── http.client               WASM 发往 Builder backend
 │   └── http.server           backend 的 AI 接口
-│       └── http.client       backend 发往模型的请求
+│       └── http.client       backend 发往模型
 └── ai.command.execute        游戏 command 的执行
 
 ai.archive
-└── http.client              同样经过 backend 的归档请求
+└── http.client               WASM 发出的归档请求
 ```
 
-`ai.transport.attempt`、`ai.upstream` 和 `ai.archive.upstream` 不再创建。代码中仍保留 `attempt_id`，但它只是 Go/WASM 与 JavaScript 之间的内部关联 ID，用来找到对应请求和处理取消，不会出现在 Sentry。
+不创建 `ai.transport.attempt`、`ai.upstream` 或 `ai.archive.upstream`。每次真正调用 `Transport.Interact` 或 `Transport.Archive` 时只创建一个 `http.client`。
 
-## 各层负责什么
+## 各层职责
 
-| 层 | 记录内容 |
+| 层 | 职责 |
 | --- | --- |
-| `ai.think` | 一次 Think 的 `outcome`、轮数、请求次数，以及 command 子 span |
-| `ai.archive` | 一次归档的耗时、请求次数和最终状态 |
-| 前端 `http.client` | 浏览器实际发出的 AI HTTP 请求、状态码和耗时 |
-| 后端 `http.server` | 原始请求/响应 body、模型 request ID、首个有效响应耗时和后端失败分类 |
-| 后端 `http.client` | 已有的模型 HTTP 请求；不改它的生命周期，也不采集 SSE |
-| `ai.command.execute` | command 名称、轮次、执行结果和普通错误文本 |
+| `tools/ai` | 定义通用 `Tracer` / `Span`；创建 Think、Archive、Command 和 `http.client` span；收口终态分类 |
+| `tools/ispx` | 用通用 JSON-RPC client 实现 `ai.Tracer`，管理 span 请求和 session 生命周期 |
+| Web Sentry adapter | 创建真实 Sentry span、记录最终 exception，并返回 propagation headers |
+| `wasmtrans` | 序列化请求、合并不透明 extra headers、执行原生 `fetch`、处理取消和解析响应 |
+| backend `http.server` | 记录请求/响应 body、模型 request ID、首个有效响应耗时和后端失败分类 |
+| backend `http.client` | 保留已有模型请求 span，不改变生命周期，也不采集原始 SSE |
 
-Sentry SDK 在父页面运行。WASM 只通知开始、结束和请求信息；真正创建前端 `http.client` 并调用 `fetch` 的代码在父页面的 `fetchAI` 中。
+JSON-RPC 不承载 AI request/response body，也不代理 HTTP。
 
-## 前端 Think 和请求
-
-`startThink` / `startArchive` 同步登记 root，并把内部 ID 写入对应的 Go context。其它桥调用异步执行，避免在 WASM 的同步调用栈上操作 Sentry。
-
-默认 Transport 通过 `NewSentryTransport` 包装。每次 `Transport.Interact` 或 `Transport.Archive` 都由 wrapper 生成一个新的 `attempt_id`，并在各自的 context 中保存，避免并发请求互相覆盖。`fetchAI` 下一拍创建 `http.client`，从这个 client 生成 `Sentry-Trace` 和 `Baggage`，再调用浏览器 `fetch`。请求完成后才结束 client span。
-
-浏览器响应 body 只读取一次，转换成普通对象后交给 WASM：
+## 请求链路
 
 ```text
-{ ok, status, statusText, retryAfter, body }
+Player.Think / Archive
+  -> tools/ai 创建 root span
+  -> TraceTransport 创建 http.client
+  -> iSPX 通过 trace/span.start 请求 Web
+  -> Web 创建 Sentry span 并返回 Sentry-Trace / Baggage
+  -> headers 写入当前 Transport context
+  -> wasmtrans 合并 headers 并调用 window.fetch
+  -> backend 续接同一条 trace
 ```
 
-WASM 继续负责解析成功响应和错误 JSON。取消请求时，Go context 和 JavaScript 的 `AbortController` 都可以中止同一个 fetch。
+`wasmtrans` 将 extra headers 当作不透明数据，同时禁止它们覆盖 `Authorization`、`Content-Type`、`Host`、`Cookie` 等凭据、载荷和浏览器控制字段。当前只发送 `Sentry-Trace` 和 `Baggage`，不发送 `traceparent` / `tracestate`。
 
-## Think 的结束状态
+Tracer 启动失败时直接降级为普通 AI 调用。失败不能阻断请求，也不能把 HTTP 改走 RPC。
 
-`ai.think` 在所有重试结束后写入 `outcome`、`turn_count` 和 `attempt_count`。只有最终确认为失败时才上报一条 exception，因此一次 Think 最多产生一条 exception。
+## 结束状态和 exception
+
+`ai.think` 写入 `outcome`、`turn_count` 和 `attempt_count`；`ai.archive` 写入 `outcome` 和 `attempt_count`。
 
 | 状态 | 含义 | exception |
 | --- | --- | --- |
-| `success` | 模型正常结束，或 command 返回 `Break` | 否 |
-| `cancelled` | 用户停止游戏或 context 被取消 | 否 |
+| `success` | 正常结束，或 command 返回 `Break` | 否 |
+| `cancelled` | 游戏停止或 context 取消 | 否 |
 | `quota_exhausted` | HTTP `403` 且 body 中 `code=40301` | 否 |
 | `rate_limited` | HTTP `429` 重试用尽 | 否 |
-| `failure` | 超时、网络错误、参数错误、handler panic、缺少初始 command 或达到轮数上限 | 是 |
+| `failure` | 超时、网络错误、参数错误、handler panic、缺少初始 command、轮数上限或归档重试用尽 | 是，一次 root 最多一条 |
 
-普通 handler error 只标记 `ai.command.execute` 并写入 `error_message`；如果交互还能继续，不把它升级成 Think exception。未知 command 写进 history，交给后续请求现场排查。
+请求级 `http.client` 失败只设置 `StatusError`，不调用 `RecordError`。最终 Think/Archive 失败才在 root 上调用一次 `RecordError`。
 
-Archive 规则类似：取消和额度结束只结束 span；非取消的重试用尽上报一条 `retries_exhausted` exception。Archive 的结果不改变 Think 的 outcome。
+Web 使用固定的 `ISPXOperationError("iSPX operation failed")` 创建 exception，只附带 `category` 和 `reason`。前端 trace 不上传原始错误文本、prompt、command args、token 或 AI request/response body。Command span 只记录 command 名称、轮次和成功状态。
 
-## 后端 AI 接口
+具体错误和请求现场从同一 trace 下的 backend `http.server` 查看。后端会按现有策略保存 `/ai-interaction/turns` 和 `/archives` 的原始 request/response body，每份最多 15 KB；超出部分截断并记录原始字节数。这一轮不修改后端采集策略。
 
-后端复用已有的 `http.server` transaction，不再创建专用 upstream span。它记录：
+## Session 生命周期
 
-- `request_body`：前端发往 `/ai-interaction/turns` 或 `/archives` 的原始 JSON。
-- `response_body`：后端返回给前端的原始 JSON。
-- `request_id`：模型响应中的请求 ID。
-- `first_meaningful_delta_ms`：模型返回第一个有效内容或 tool call 的耗时。
-- `category` / `reason`：后端对失败的分类标签。
+`ProjectRunner` 在每次运行时创建一个 JSON-RPC session。stop、rerun、unmount、iframe reload、game error 或 exit 都会关闭旧 session：
 
-后端直接把 `category`、`reason` 和 `request_id` 写到当前 `http.server` transaction，不把这些仅用于排查的字段复制到公共 HTTP 错误响应。
+- 拒绝 pending call。
+- 结束残留 span。
+- 忽略旧 session 的迟到消息。
 
-后端失败时只把对应 transaction 标为 error，不直接 `CaptureException`。一个 Think/Archive 可能包含多次 HTTP 重试；如果后端每次失败都上报 exception，同一次最终失败会产生多条 Issue 事件。最终是否失败只有前端流程知道，因此由前端在所有重试结束后至多上报一次 exception。后端 transaction 保留每次模型调用的根因和现场，前端 exception 表示整次 Think/Archive 的最终结果。
+一次 Think 在开始时快照当前 session Tracer，并通过派生 context 传给请求和 Command。异步 Archive 只继承这份 Tracer，不复用已经结束的调用 context，因此旧运行不会读到新运行的全局 Tracer。
 
-前端 exception 使用前端流程自己的 `category` / `reason`，不复制后端分类。排查时通过同一条 trace，从最终 exception 进入对应的后端 transaction 查看精确根因和 `request_id`。
+## 采样
 
-### 失败分类
+当前 `ispxSampleRate` 保持为 `1`，采样行为不变。是否下调由产品和观测成本单独决定，不属于本次架构调整。
 
-传输或 provider 错误属于 `upstream_failure`，原因是 `timeout` 或 `provider_error`。模型响应不符合合同则属于 `model_response_invalid`，原因包括：
+## 验收
 
-```text
-blocked
-truncated
-no_choices
-missing_required_tool_call
-invalid_tool_call
-unexpected_finish_reason
-```
+在 Sentry 中确认：
 
-归档结果为空属于 `archive_failure / empty_archive`。额度边界保持为 HTTP `403` + `code=40301`；普通 `403` 不当作额度错误。
-
-## Body 大小
-
-`request_body` 和 `response_body` 都是原始 body，不做字段级解析，也不采集完整 OpenAI messages 或原始 SSE。每个 body 最多记录 15 KB；超出时截断，并记录原始字节数：
-
-```text
-request_body_dropped
-response_body_dropped
-```
-
-body 放在 data/context 中，不放在 tag 中。短字段使用 tag，便于筛选；大字段只在点开对应 transaction 时查看。
-
-## 验收方式
-
-在 Sentry 中：
-
-1. 搜 `span.op:ai.think`，确认 Think 是独立 root，并能看到浏览器 `http.client`。
-2. 搜 `transaction:"POST /ai-interaction/turns"` 或 `transaction:"POST /ai-interaction/archives"`，查看 `request_body`、`response_body`、`request_id` 和失败标签。
-3. 在 Issues 中只应看到真正的 Think/Archive failure；取消、额度耗尽和 429 不产生 exception。
-
-自定义 attribute 不一定会出现在 Explore 的默认字段列表中，应点开 span 查看。SDK 的 `span.category=http` 与业务 tag `category` 不是同一个字段。
-
-## 当前范围
-
-已完成 Think/Archive trace、浏览器 client、后端 server 现场、终态和失败标签。生产采样率调整、精灵名 tag、Copilot 采集、完整模型 messages 和 SSE 内容不在本文范围内。
+1. 成功 Think 有一个 `ai.think` root、对应的 `http.client` 和 Command 子 span。
+2. 一次失败后重试成功时，每次真实请求各有一个 client span，root 不产生 exception。
+3. 三次请求失败时有三个 client span，root 最多一条 exception，且只带 `category/reason`。
+4. quota、429 和 cancel 不产生 exception。
+5. Archive success/failure 的 span 状态和请求次数正确。
+6. 浏览器请求携带 `Sentry-Trace/Baggage`，后端续接同一 trace。
+7. stop/rerun 后旧消息不会进入新 session，并发 Player 的 headers 不串。

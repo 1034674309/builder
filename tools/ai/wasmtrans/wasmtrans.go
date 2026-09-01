@@ -146,14 +146,8 @@ func (t *wasmTransport) fetchAndParse(ctx context.Context, path string, body []b
 	return nil
 }
 
-// responseBody accepts both the bridge's normalized response ({body: string})
-// and the native Response returned by the no-bridge fallback. In either case
-// the body is consumed at most once.
+// responseBody consumes the native Response body at most once.
 func responseBody(ctx context.Context, response js.Value) (string, error) {
-	body := response.Get("body")
-	if body.Type() == js.TypeString {
-		return body.String(), nil
-	}
 	bodyText, err := awaitPromise(ctx, response.Call("text"))
 	if err != nil {
 		return "", err
@@ -161,12 +155,8 @@ func responseBody(ctx context.Context, response js.Value) (string, error) {
 	return bodyText.String(), nil
 }
 
-// retryAfterFromResponse reads the bridge's retryAfter field, or the native
-// Response Retry-After header used by the no-bridge fetch fallback.
+// retryAfterFromResponse reads the native Response Retry-After header.
 func retryAfterFromResponse(jsResp js.Value) time.Duration {
-	if value := jsResp.Get("retryAfter"); value.Type() == js.TypeString {
-		return ai.RetryAfterFromHeader(value.String())
-	}
 	headers := jsResp.Get("headers")
 	if !headers.Truthy() {
 		return 0
