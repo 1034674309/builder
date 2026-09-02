@@ -23,7 +23,7 @@ ai.archive
 
 | 层 | 职责 |
 | --- | --- |
-| `tools/ai` | 定义通用 `Tracer` / `Span`；创建 Think、Archive、Command 和 `http.client` span；收口终态分类 |
+| `tools/ai` | 定义通用 `Tracer` / `Span`；创建 Think、Archive、Command 和 `http.client` span；由调用处确定最终 `category/reason` |
 | `tools/ispx` | 用通用 JSON-RPC client 实现 `ai.Tracer`，管理 span 请求和 session 生命周期 |
 | Web Sentry adapter | 创建真实 Sentry span、记录最终 exception，并返回 propagation headers |
 | `wasmtrans` | 序列化请求、合并不透明 extra headers、执行原生 `fetch`、处理取消和解析响应 |
@@ -65,7 +65,7 @@ Tracer 启动失败时直接降级为普通 AI 调用。失败不能阻断请求
 
 Web 使用固定的 `ISPXOperationError("iSPX operation failed")` 创建 exception，只附带 `category` 和 `reason`。前端 trace 不上传原始错误文本、prompt、command args、token 或 AI request/response body。Command span 只记录 command 名称、轮次和成功状态。
 
-具体错误和请求现场从同一 trace 下的 backend `http.server` 查看。后端会按现有策略保存 `/ai-interaction/turns` 和 `/archives` 的原始 request/response body，每份最多 15 KB；超出部分截断并记录原始字节数。这一轮不修改后端采集策略。
+具体错误和请求现场从同一 trace 下的 backend `http.server` 查看。配套的 [builder-backend#351](https://github.com/goplus/builder-backend/pull/351) 只在 `/ai-interaction/turns` 和 `/archives` 保存原始 request/response body，每份最多 15 KB；超出部分截断并记录完整 body 的原始字节数。`category/reason`、模型 request ID 和首个有效响应耗时也只写入这条 server transaction；公共错误响应仍保持原有 `code/msg` 契约，后端不额外创建 exception。
 
 ## Session 生命周期
 

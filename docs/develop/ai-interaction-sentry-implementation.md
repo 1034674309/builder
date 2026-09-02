@@ -9,7 +9,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `tools/ai/trace.go` | 定义 `Tracer`、`Span`、`SpanInfo`、`SpanEnd`、`ErrorInfo` 和 Noop 实现 |
-| `tools/ai/trace_operation.go` | 创建并结束 Think、Archive 和 Command span；最终失败只记录 `category/reason` |
+| `tools/ai/trace_operation.go` | 保存当前 game session ID；创建并结束 Think、Archive 和 Command span；最终失败只记录 `category/reason` |
 | `tools/ai/trace_transport.go` | 每次真实 Transport 调用创建一个 `http.client`；失败只设置 span 状态 |
 | `tools/ai/transport_context.go` | 在 context 中复制保存不透明 extra headers |
 | `tools/ai/ai.go` / `classify.go` | Think/Archive 重试、取消、Tracer 快照和终态分类 |
@@ -38,7 +38,16 @@
 
 ### Builder backend
 
-后端不在本次前端重构范围内。现有 `http.server` middleware 继续捕获 AI API 的 request/response body，并由 AI interaction 逻辑记录模型 request ID、TTFT 和失败标签。
+配套的 [builder-backend#351](https://github.com/goplus/builder-backend/pull/351) 不增加新的业务 span，而是扩展现有 `http.server` transaction：
+
+| 文件 | 作用 |
+| --- | --- |
+| `cmd/xbuilder-backend/middleware.go` | 续接浏览器 trace；仅为两个 AI API 捕获最多 15 KB 的 request/response body；写入请求期间积累的 metadata |
+| `internal/tracer/metadata.go` | 提供 context 内通用、并发安全的 tag/extra 记录器，并在读取时返回快照 |
+| `internal/aiinteraction/aiinteraction.go` | 记录模型 request ID、首个有效响应耗时，以及最终失败的 `category/reason` |
+| `internal/aiinteraction/failure.go` | 分类 AI interaction 内部错误；诊断字段不进入公共 `code/msg` 响应 |
+
+后端保留已有模型 `http.client` span，不创建 `ai.upstream`、attempt span 或额外 exception。
 
 ## 一次 Think 请求
 
@@ -88,8 +97,12 @@ GOOS=js GOARCH=wasm go build ./...
 
 cd ../../spx-gui
 pnpm type-check
-pnpm vitest --run src/ispx/rpc.test.ts src/ispx/sentry-trace-adapter.test.ts
+pnpm exec vitest run src/ispx/rpc.test.ts src/ispx/sentry-trace-adapter.test.ts
 pnpm build
+
+# 在 builder-backend checkout 中
+go test ./...
+go vet ./internal/aiinteraction ./internal/tracer ./cmd/xbuilder-backend
 
 git diff --check
 ```
@@ -98,8 +111,7 @@ git diff --check
 
 ## 不在本次实现中
 
-- Builder backend 行为修改。
 - 生产环境采样率下调。
 - `traceparent` / `tracestate`。
 - Copilot tracing 或公共 HTTP client 改造。
-- prompt、command args、token、完整 OpenAI messages 或原始 SSE 的额外采集。
+- 前端上传 prompt、command args、token 或 AI body，以及后端对完整 OpenAI messages 或原始 SSE 的额外采集。
