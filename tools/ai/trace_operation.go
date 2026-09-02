@@ -1,6 +1,9 @@
 package ai
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 const (
 	thinkSpanName      = "ai.think"
@@ -16,6 +19,24 @@ const (
 	commandNameAttr    = "command_name"
 	commandSuccessAttr = "success"
 )
+
+var gameSession struct {
+	sync.RWMutex
+	id string
+}
+
+// SetGameSessionID stores the current game run ID supplied by the runner.
+func SetGameSessionID(id string) {
+	gameSession.Lock()
+	gameSession.id = id
+	gameSession.Unlock()
+}
+
+func currentGameSessionID() string {
+	gameSession.RLock()
+	defer gameSession.RUnlock()
+	return gameSession.id
+}
 
 func startOperationSpan(ctx context.Context, info SpanInfo) (context.Context, Span) {
 	tracer := tracerFromContext(ctx)
