@@ -155,7 +155,7 @@ import { useRenderableImageUrl } from '@/utils/img-rendering'
 import { registerPlayer } from '@/utils/player-registry'
 import { addPrefetchLink } from '@/utils/dom'
 import { RPCSession } from '@/ispx/rpc'
-import { createSentryTraceAdapter } from '@/ispx/sentry-trace-adapter'
+import { createSentryTelemetryAdapter } from '@/ispx/sentry-telemetry-adapter'
 import type { Files } from '@/models/common/file'
 import { hashFiles } from '@/models/common/hash'
 import type { SpxProject } from '@/models/spx/project'
@@ -200,7 +200,7 @@ function closeISPXRPCSession() {
 
 function installISPXRPCSession(iframeWindow: RunnerIframeWindow) {
   closeISPXRPCSession()
-  const session = new RPCSession(createSentryTraceAdapter(), (message) => {
+  const session = new RPCSession(createSentryTelemetryAdapter(), (message) => {
     iframeWindow.xbuilder_handle_rpc_message(message)
   })
   ispxRPCSession = { session, iframeWindow }

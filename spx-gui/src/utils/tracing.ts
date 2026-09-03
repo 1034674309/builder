@@ -47,7 +47,7 @@ export function isCodeEditorOperation(name: string): boolean {
 }
 
 export function isAIOperation(name: string): boolean {
-  return name.startsWith('ai.')
+  return name.startsWith('ai.') || name === 'POST /ai-interaction/turns' || name === 'POST /ai-interaction/archives'
 }
 
 type IdleSpanOptions = NonNullable<Parameters<typeof SentryCore.startIdleSpan>[1]>

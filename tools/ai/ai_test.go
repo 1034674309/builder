@@ -118,6 +118,39 @@ func TestPlayerThinkReportsTurnLimit(t *testing.T) {
 	}
 }
 
+func TestPlayerThinkKeepsTransportForCompleteInteraction(t *testing.T) {
+	type continueCommand struct{}
+
+	originalTransport := DefaultTransport()
+	t.Cleanup(func() { SetDefaultTransport(originalTransport) })
+
+	var firstCalls, replacementCalls int
+	replacement := &mockTransport{InteractFunc: func(context.Context, Request) (Response, error) {
+		replacementCalls++
+		return Response{Text: "unexpected"}, nil
+	}}
+	first := &mockTransport{InteractFunc: func(context.Context, Request) (Response, error) {
+		firstCalls++
+		if firstCalls == 1 {
+			SetDefaultTransport(replacement)
+			return Response{CommandName: reflect.TypeOf(continueCommand{}).Name()}, nil
+		}
+		return Response{Text: "done"}, nil
+	}}
+	SetDefaultTransport(first)
+
+	p := &Player{errorHandler: func(err error) { t.Errorf("unexpected interaction error: %v", err) }}
+	PlayerOnCmd_(p, continueCommand{}, func(continueCommand) error { return nil })
+	p.think(t.Context(), nil, "continue", nil)
+
+	if firstCalls != 2 {
+		t.Fatalf("original transport calls = %d; want 2", firstCalls)
+	}
+	if replacementCalls != 0 {
+		t.Fatalf("replacement transport calls = %d; want 0", replacementCalls)
+	}
+}
+
 func TestPlayerThinkQuotaExceededDoesNotRetry(t *testing.T) {
 	originalTransport := DefaultTransport()
 	t.Cleanup(func() { SetDefaultTransport(originalTransport) })

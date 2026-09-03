@@ -90,11 +90,7 @@ func extractCommandSpec(cmdType reflect.Type) CommandSpec {
 // callCommandHandler handles the overall logic for executing a command
 // handler. It creates the command struct, populates its fields, calls the
 // handler, and processes the result.
-func callCommandHandler(ctx context.Context, owner any, info commandInfo, args map[string]any, turnIndex int) (result *CommandResult, err error) {
-	span := startCommand(ctx, turnIndex, info.spec.Name)
-	spanOK := false
-	defer func() { endCommand(span, spanOK) }()
-
+func callCommandHandler(owner any, info commandInfo, args map[string]any) (result *CommandResult, err error) {
 	// Create a new zero value of the command struct type (T).
 	cmdType := info.typ
 	cmdPtrVal := reflect.New(cmdType)
@@ -102,10 +98,7 @@ func callCommandHandler(ctx context.Context, owner any, info commandInfo, args m
 
 	// Populate struct fields from args.
 	if popErr := populateCommandFields(cmdVal, args); popErr != nil {
-		return nil, &invalidArgumentsError{
-			command: info.spec.Name,
-			err:     fmt.Errorf("failed to populate command fields for %s: %w", info.spec.Name, popErr),
-		}
+		return nil, fmt.Errorf("failed to populate command fields for %s: %w", info.spec.Name, popErr)
 	}
 
 	// Call the actual handler function.
@@ -126,10 +119,7 @@ func callCommandHandler(ctx context.Context, owner any, info commandInfo, args m
 		}(reflect.ValueOf(info.handler))
 	})
 	if handlerCallErr != nil {
-		return nil, &handlerPanicError{
-			command: info.spec.Name,
-			err:     fmt.Errorf("failed to call command handler for %s: %w", info.spec.Name, handlerCallErr),
-		}
+		return nil, fmt.Errorf("failed to call command handler for %s: %w", info.spec.Name, handlerCallErr)
 	}
 
 	// Process handler results.
@@ -155,7 +145,7 @@ func callCommandHandler(ctx context.Context, owner any, info commandInfo, args m
 		result.Success = false
 		result.ErrorMessage = handlerErr.Error()
 	}
-	spanOK = result.Success
+
 	return result, nil
 }
 

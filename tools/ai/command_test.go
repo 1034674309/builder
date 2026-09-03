@@ -1,7 +1,6 @@
 package ai
 
 import (
-	"context"
 	"errors"
 	"math"
 	"reflect"
@@ -251,7 +250,7 @@ func TestCallCommandHandler(t *testing.T) {
 			if tt.handlerFunc != nil {
 				info.handler = tt.handlerFunc
 			}
-			result, err := callCommandHandler(context.Background(), nil, info, tt.args, 0)
+			result, err := callCommandHandler(nil, info, tt.args)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error")

@@ -33,7 +33,7 @@ export function initSentry(app: VueApp<Element>, router: Router | undefined, con
           // We use data URLs for inlineable file, see details in `src/models/common/cloud.ts`.
           // Ignore them to avoid exceeding event size limits.
           if (url.startsWith('data:')) return false
-          // AI requests create their own http.client under ai.think / ai.archive.
+          // AI requests create their own independent http.client transactions.
           // API base URLs vary between deployments and may or may not include /api.
           if (url.includes('/ai-interaction/turns') || url.includes('/ai-interaction/archives')) return false
           return true

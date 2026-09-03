@@ -8,20 +8,20 @@ import (
 	"sync"
 	"syscall/js"
 
-	"github.com/goplus/builder/tools/ai"
 	"github.com/goplus/builder/tools/ispx/internal/rpc"
+	"github.com/goplus/builder/tools/ispx/internal/telemetry"
 	"github.com/goplus/xgo/x/jsonrpc2"
 )
 
 var rpcSession struct {
 	sync.RWMutex
-	client *rpc.Client
+	client    *rpc.Client
+	telemetry *telemetry.Client
 }
 
 func init() {
 	js.Global().Set("xbuilder_set_message_replier", js.FuncOf(setMessageReplier))
 	js.Global().Set("xbuilder_handle_rpc_message", js.FuncOf(handleRPCMessage))
-	ai.SetDefaultTracer(nil)
 }
 
 type messageReplier struct {
@@ -53,19 +53,27 @@ func setMessageReplier(this js.Value, args []js.Value) any {
 		next = rpc.NewClient(&messageReplier{value: args[0]})
 	}
 
+	var tc *telemetry.Client
+	if next != nil {
+		tc = telemetry.NewClient(next)
+	}
+
 	rpcSession.Lock()
 	previous := rpcSession.client
 	rpcSession.client = next
+	rpcSession.telemetry = tc
 	rpcSession.Unlock()
 	if previous != nil {
 		previous.Close()
 	}
-	if next == nil {
-		ai.SetDefaultTracer(nil)
-	} else {
-		ai.SetDefaultTracer(NewRPCTracer(next))
-	}
+	resetAIDefaultTransport()
 	return nil
+}
+
+func currentTelemetryClient() *telemetry.Client {
+	rpcSession.RLock()
+	defer rpcSession.RUnlock()
+	return rpcSession.telemetry
 }
 
 func handleRPCMessage(this js.Value, args []js.Value) any {

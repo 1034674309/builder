@@ -56,9 +56,9 @@ func setAIDescription(this js.Value, args []js.Value) any {
 var aiInteractionAPIEndpoint string
 
 func setGameSessionID(this js.Value, args []js.Value) any {
-	if len(args) > 0 {
-		ai.SetGameSessionID(args[0].String())
-	}
+	// Game session ID is currently unused. The registration point is kept so
+	// the runner JavaScript does not break.
+	_ = args
 	return nil
 }
 
@@ -137,9 +137,9 @@ func resetAIDefaultTransport() {
 	if aiInteractionAPIEndpoint == "" || aiInteractionAPITokenProvider == nil {
 		return
 	}
-	transport := wasmtrans.New(
+	base := wasmtrans.New(
 		wasmtrans.WithEndpoint(aiInteractionAPIEndpoint),
 		wasmtrans.WithTokenProvider(aiInteractionAPITokenProvider),
 	)
-	ai.SetDefaultTransport(ai.NewTraceTransport(transport))
+	ai.SetDefaultTransport(newTelemetryTransport(base, currentTelemetryClient()))
 }

@@ -125,17 +125,16 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 		rateLimitWaitTimeout = 2 * time.Minute        // Maximum wait time for rate limiting.
 	)
 
-	thinkCtx := withTracer(ctx, tracerFromContext(ctx))
 	p.beginInteraction()
-	var finish thinkFinish
-	thinkCtx, thinkSpan := startThink(thinkCtx)
+	// Keep one Transport for the complete interaction so a runner session change
+	// cannot move an in-flight Player onto a newly installed global transport.
+	transport := p.transport()
 	defer func() {
-		endThink(thinkSpan, finish)
 		p.endInteraction()
 		if ctx.Err() != nil {
 			return
 		}
-		p.scheduleHistoryManagement(owner, tracerFromContext(thinkCtx))
+		p.scheduleHistoryManagement(owner, transport)
 	}()
 
 	var (
@@ -143,10 +142,8 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 		currentContext = context
 
 		hasExecutedAtLeastOneCommandInThisCall bool
-		attemptCount                           int
 	)
 	for i := range maxTurns {
-		turnCount := i + 1
 		// Prepare request.
 		p.mu.RLock()
 		currentRole := p.role
@@ -161,7 +158,6 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 			}
 		}
 		currentKnowledgeBase := p.knowledgeBase()
-		currentTransport := p.transport()
 		p.mu.RUnlock()
 
 		request := Request{
@@ -197,9 +193,8 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 				break
 			}
 
-			attemptCtx, cancel := stdContext.WithTimeout(thinkCtx, transportTimeout)
-			attemptCount++
-			resp, lastErr = currentTransport.Interact(attemptCtx, request)
+			attemptCtx, cancel := stdContext.WithTimeout(ctx, transportTimeout)
+			resp, lastErr = transport.Interact(attemptCtx, request)
 			cancel()
 			if lastErr == nil {
 				break
@@ -211,12 +206,10 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 			rateGate.Observe(lastErr)
 		}
 		if err := ctx.Err(); err != nil {
-			finish = thinkFinish{outcome: outcomeCancelled}.withCounts(turnCount, attemptCount)
 			p.handleError(owner, fmt.Errorf("ai interaction canceled: %w", err))
 			return
 		}
 		if lastErr != nil {
-			finish = classifyTransportStop(lastErr).withCounts(turnCount, attemptCount)
 			p.handleError(owner, fmt.Errorf("ai interaction failed after %d transport attempts: %w", maxTransportAttempts, lastErr))
 			return
 		}
@@ -234,14 +227,7 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 			p.appendHistory(noCmdTurn)
 
 			if !hasExecutedAtLeastOneCommandInThisCall {
-				finish = thinkFinish{
-					outcome:  outcomeFailure,
-					category: categoryModelQualityFailure,
-					reason:   reasonMissingInitialCommand,
-				}.withCounts(turnCount, attemptCount)
 				p.handleError(owner, errors.New("ai did not provide an initial command or any command during the interaction"))
-			} else {
-				finish = thinkFinish{outcome: outcomeSuccess}.withCounts(turnCount, attemptCount)
 			}
 			return
 		}
@@ -253,9 +239,8 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 		p.mu.RUnlock()
 		if ok {
 			var err error
-			executedResult, err = callCommandHandler(thinkCtx, owner, cmdInfo, resp.CommandArgs, i)
+			executedResult, err = callCommandHandler(owner, cmdInfo, resp.CommandArgs)
 			if err != nil {
-				finish = classifyCommandStopFinish(err).withCounts(turnCount, attemptCount)
 				p.handleError(owner, fmt.Errorf("failed to execute command %s: %w", resp.CommandName, err))
 				return
 			}
@@ -283,7 +268,6 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 
 		// Check for [Break].
 		if executedResult.IsBreak {
-			finish = thinkFinish{outcome: outcomeSuccess}.withCounts(turnCount, attemptCount)
 			return
 		}
 
@@ -293,11 +277,6 @@ func (p *Player) think(ctx stdContext.Context, owner any, msg string, context ma
 		currentContext = nil
 	}
 
-	finish = thinkFinish{
-		outcome:  outcomeFailure,
-		category: categoryModelQualityFailure,
-		reason:   reasonTurnLimit,
-	}.withCounts(maxTurns, attemptCount)
 	p.handleError(owner, fmt.Errorf("ai interaction did not complete within %d turns", maxTurns))
 }
 
@@ -365,16 +344,16 @@ func (p *Player) appendHistory(turn Turn) {
 // scheduleHistoryManagement starts history management in an owner-scoped
 // coroutine so it can outlive the caller without outliving its owner. The
 // blocking archive work runs natively to avoid blocking the game engine.
-func (p *Player) scheduleHistoryManagement(owner any, tracer Tracer) {
+func (p *Player) scheduleHistoryManagement(owner any, transport Transport) {
 	spx.Go(owner, func(ctx stdContext.Context, _ any) {
 		spx.ExecuteNative(func(_ stdContext.Context, _ any) {
-			p.manageHistory(withTracer(ctx, tracer))
+			p.manageHistory(ctx, transport)
 		})
 	})
 }
 
 // manageHistory checks if archiving is needed and performs it if necessary.
-func (p *Player) manageHistory(ctx stdContext.Context) {
+func (p *Player) manageHistory(ctx stdContext.Context, transport Transport) {
 	const (
 		archiveTimeout       = 120 * time.Second      // Timeout for archive operation.
 		maxArchiveAttempts   = 3                      // Maximum number of archive attempts.
@@ -390,15 +369,10 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 	}
 
 	// Perform archive with retries.
-	transport := p.transport()
-	archiveCtx, archiveSpan := startArchive(ctx)
-	var finish archiveFinish
-	defer func() { endArchive(archiveSpan, finish) }()
 	var (
-		archived     ArchivedHistory
-		lastErr      error
-		rateGate     rateLimitGate
-		attemptCount int
+		archived ArchivedHistory
+		lastErr  error
+		rateGate rateLimitGate
 	)
 	for range backoffAttempts(ctx, maxArchiveAttempts, backoffBase, backoffCap) {
 		waitCtx, waitCancel := stdContext.WithTimeout(ctx, rateLimitWaitTimeout)
@@ -415,8 +389,7 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 			break
 		}
 
-		attemptCtx, cancel := stdContext.WithTimeout(archiveCtx, archiveTimeout)
-		attemptCount++
+		attemptCtx, cancel := stdContext.WithTimeout(ctx, archiveTimeout)
 		archived, lastErr = transport.Archive(attemptCtx, turnsToArchive, existingArchive)
 		cancel()
 		if lastErr == nil {
@@ -429,36 +402,26 @@ func (p *Player) manageHistory(ctx stdContext.Context) {
 		rateGate.Observe(lastErr)
 	}
 	if err := ctx.Err(); err != nil {
-		finish = archiveFinish{outcome: outcomeCancelled, attemptCount: attemptCount}
 		log.Printf("archive history canceled: %v", err)
 		p.cancelArchive()
 		return
 	}
 	if isQuotaExceeded(lastErr) {
-		finish = archiveFinish{outcome: outcomeQuotaExhausted, attemptCount: attemptCount}
 		log.Printf("archive history stopped: %v", lastErr)
 		p.cancelArchive()
 		return
 	}
 	if isTooManyRequests(lastErr) {
-		finish = archiveFinish{outcome: outcomeRateLimited, attemptCount: attemptCount}
 		log.Printf("archive history rate limited: %v", lastErr)
 		p.cancelArchive()
 		return
 	}
 	if lastErr != nil {
-		finish = archiveFinish{
-			outcome:      outcomeFailure,
-			category:     categoryArchiveFailure,
-			reason:       reasonRetriesExhausted,
-			attemptCount: attemptCount,
-		}
 		log.Printf("failed to archive history after %d attempts: %v", maxArchiveAttempts, lastErr)
 		p.cancelArchive()
 		return
 	}
 
-	finish = archiveFinish{outcome: outcomeSuccess, attemptCount: attemptCount}
 	p.applyArchive(archived.Content, len(turnsToArchive))
 }
 
